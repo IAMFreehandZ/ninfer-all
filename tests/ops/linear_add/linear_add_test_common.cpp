@@ -37,6 +37,10 @@ constexpr ReductionCriterion kLinearAddA16Tolerance{
     2.0 * kBf16UnitRoundoff,
 };
 
+// The same A8 activation allowance as public Linear and FP8 LinearAdd. The FP64 oracle evaluates
+// the full residual-plus-projection formula; private materialization/casts are not reproduced.
+constexpr ReductionCriterion kLinearAddA8Tolerance{0.04, kBf16UnitRoundoff, 0.06};
+
 std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
     if (first <= 0 || second <= 0) {
         throw std::invalid_argument(std::string("linear_add test: invalid ") + label + " extent");
@@ -102,7 +106,8 @@ std::vector<std::int32_t> conformance_tokens(const ShapeCase& shape) {
     return result;
 }
 
-std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed) {
+std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed,
+                                           bool signed_input = false) {
     std::vector<std::uint16_t> result(checked_elements(k, t, "activation"));
     for (std::int32_t token = 0; token < t; ++token) {
         for (std::int32_t column = 0; column < k; ++column) {
@@ -112,8 +117,9 @@ std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::
                 static_cast<std::uint64_t>(seed) * 13U +
                 token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U);
             const int raw = 32 + static_cast<int>(coordinate & 0x5fU);
+            const float sign = signed_input && (coordinate & 0x100U) != 0 ? -1.0F : 1.0F;
             result[static_cast<std::size_t>(token) * k + column] =
-                test::f32_to_bf16(static_cast<float>(raw) * (1.0F / 256.0F));
+                test::f32_to_bf16(sign * static_cast<float>(raw) * (1.0F / 256.0F));
         }
     }
     return result;
@@ -215,8 +221,10 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
 }
 
 int compare_output(std::string_view label, std::span<const double> actual,
-                   std::span<const double> reference) {
-    return verify_reduction(label, actual, reference, kLinearAddA16Tolerance);
+                   std::span<const double> reference, WeightFormat format) {
+    return verify_reduction(label, actual, reference,
+                            format == WeightFormat::T2G128F16S ? kLinearAddA8Tolerance
+                                                              : kLinearAddA16Tolerance);
 }
 
 int verify_preserved(const test::GuardedDeviceBuffer& device,
@@ -240,6 +248,8 @@ QType qtype_for(WeightFormat format) {
         return QType::Q5_G64_FP16;
     case WeightFormat::Q8G32F16S:
         return QType::Q8_G32_FP16;
+    case WeightFormat::T2G128F16S:
+        return QType::T2_G128_FP16;
     }
     throw std::invalid_argument("linear_add test: unknown weight format");
 }
@@ -249,7 +259,8 @@ HostWeight make_weight(WeightFormat format, const ShapeCase& shape) {
         return direct_bf16_weight::make_patterned(shape.n, shape.k, shape.seed);
     }
     const quantized_weight::PatternedWeightOptions options{
-        (format == WeightFormat::Q4G64F16S || format == WeightFormat::Q5G64F16S)
+        (format == WeightFormat::Q4G64F16S || format == WeightFormat::Q5G64F16S ||
+         format == WeightFormat::T2G128F16S)
             ? quantized_weight::RowSplitScalePattern::Small
             : quantized_weight::RowSplitScalePattern::Tiny,
         quantized_weight::RowSplitCodePattern::Hashed,
@@ -316,7 +327,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     const HostWeight host_weight           = make_weight(format, shape);
     const std::vector<float> oracle_weight = materialize_weight_rows(host_weight, oracle_rows);
     const std::vector<std::uint16_t> activation =
-        make_activation(shape.k, maximum_t, shape.seed + 1U);
+        make_activation(shape.k, maximum_t, shape.seed + 1U, format == WeightFormat::T2G128F16S);
     const std::vector<std::uint16_t> residual = make_residual(shape.n, maximum_t, shape.seed + 2U);
     const std::vector<std::int32_t> all_columns = all_indices(maximum_t);
     const std::vector<double> full_reference    = linear_add_oracle(
@@ -329,8 +340,10 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     device_weight.copy_from_host(host_payload.data(), host_payload.size());
     const Weight weight = make_device_weight_view(host_weight, device_weight.data());
 
+    const ops::LinearPolicy policy = format == WeightFormat::T2G128F16S
+        ? ops::LinearPolicy::AllowA8Int : ops::LinearPolicy::A16Only;
     const std::size_t workspace_bytes =
-        ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, 1, maximum_t);
+        ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, policy, 1, maximum_t);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures              = 0;
@@ -358,10 +371,10 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                                std::span<const double>(
                                    full_reference.data(),
                                    checked_elements(static_cast<std::int32_t>(oracle_rows.size()),
-                                                    t, "reference")));
+                                                    t, "reference")), format);
         };
         try {
-            ops::linear_add(input, weight, residual_out, workspace, nullptr);
+            ops::linear_add(input, weight, residual_out, policy, workspace, nullptr);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
             verify_result();
             if ((t == 128 && format == WeightFormat::Q5G64F16S) ||
@@ -372,7 +385,8 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 cudaGraphExec_t executable;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
                 CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-                ops::linear_add(input, weight, residual_out, ops::LinearPolicy::AllowA4, workspace,
+                ops::linear_add(input, weight, residual_out,
+                                format == WeightFormat::T2G128F16S ? policy : ops::LinearPolicy::AllowA4, workspace,
                                 stream);
                 CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
                 CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
@@ -407,9 +421,10 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 CUDA_CHECK(cudaGraphDestroy(graph));
                 CUDA_CHECK(cudaStreamDestroy(stream));
                 output.copy_from_host(residual.data(), output.bytes());
-                ops::linear_add(input, weight, residual_out, ops::LinearPolicy::AllowA8, workspace,
+                ops::linear_add(input, weight, residual_out,
+                                format == WeightFormat::T2G128F16S ? policy : ops::LinearPolicy::AllowA8, workspace,
                                 nullptr);
-                test::cuda_check(cudaDeviceSynchronize(), "synchronize permissive A16 linear_add");
+                test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add after graph replay");
                 verify_result();
             }
         } catch (const std::exception& error) {
@@ -422,14 +437,18 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             continue;
         }
         const std::size_t exact_workspace =
-            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
-        if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
+            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, policy, t, t);
+        // T2's public capacity also covers the A16 projected plane; its fused A8 residual route
+        // can use less than that bound. Other existing registrations have exact witnesses.
+        const bool workspace_mismatch = format == WeightFormat::T2G128F16S
+            ? workspace.peak_used() > exact_workspace : workspace.peak_used() != exact_workspace;
+        if (workspace.used() != 0 || workspace_mismatch) {
             std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
             ++failures;
         }
         executed_peak = std::max(executed_peak, workspace.peak_used());
     }
-    if (executed_peak != workspace_bytes) {
+    if (format != WeightFormat::T2G128F16S && executed_peak != workspace_bytes) {
         std::cerr << label << ": interval workspace capacity has no executed high-water witness\n";
         ++failures;
     }

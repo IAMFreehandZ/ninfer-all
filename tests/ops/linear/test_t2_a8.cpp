@@ -1,4 +1,5 @@
 #include "ops/linear/linear_test_common.h"
+#include "ops/device_profile_fixture.h"
 
 #include <array>
 #include <exception>
@@ -13,9 +14,8 @@ constexpr Invocation a8(std::int32_t t) {
     return {t, CallForm::Policy, ops::LinearPolicy::AllowA8Int};
 }
 
-// The ternary integer-activation routes through one policy: the small-T kernel (1..192 tokens, in
-// launches of one, two and four column tiles) and above it the prefill GEMM, which pads T to its
-// cheapest tile width inside.
+// The ternary integer-activation routes share one policy. Measured profiles choose small-T
+// kernels up to their 192-token limit or the prefill GEMM, which pads T to its tile width.
 int t2_a8_conformance() {
     int failures = 0;
 
@@ -38,6 +38,13 @@ int t2_a8_conformance() {
     failures += run_shape("T2_A8", ActivationCompute::A8, make_t2_g128_fp16_weight,
                           {5120, 17408, 311U, Comparison::Full, false, kWidths});
 
+    // The actual full vocabulary head reads this calibrated route key. TopK's ternary producer
+    // uses A16 Linear and does not qualify the integer activation head path.
+    constexpr std::array kHeadWidths{a8(1), a8(2), a8(3), a8(4), a8(5), a8(6),
+                                     a8(7), a8(8), a8(12), a8(16), a8(193)};
+    failures += run_shape("T2_A8 full head", ActivationCompute::A8, make_t2_g128_fp16_weight,
+                          {248320, 5120, 313U, Comparison::SampledRows, true, kHeadWidths});
+
     return failures;
 }
 
@@ -50,6 +57,7 @@ int main() {
     }
 
     try {
+        ninfer::test::install_device_profile_fixture_from_env();
         const int failures = t2_a8_conformance();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " T2_A8 Linear\n";
         return failures == 0 ? 0 : 1;

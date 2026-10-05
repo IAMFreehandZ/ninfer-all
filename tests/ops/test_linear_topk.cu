@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/device_profile_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -499,25 +500,35 @@ int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool t2_only = argc == 2 && std::string(argv[1]) == "--t2-only";
+    if (argc != 1 && !t2_only) {
+        std::cerr << "usage: ninfer_linear_topk_test [--t2-only]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
+        install_device_profile_fixture_from_env();
         const std::vector<std::uint16_t> host_hidden = make_hidden();
         DeviceBuffer hidden(host_hidden.size() * sizeof(std::uint16_t));
         hidden.copy_from_host(host_hidden.data(), hidden.bytes);
 
         int failures = 0;
-        failures += run_full(QType::Q8_G32_FP16, "q8-full", hidden,
-                             base_scores(QType::Q8_G32_FP16, host_hidden));
-        failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
-                             base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
+        if (!t2_only) {
+            failures += run_full(QType::Q8_G32_FP16, "q8-full", hidden,
+                                 base_scores(QType::Q8_G32_FP16, host_hidden));
+            failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
+                                 base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
+        }
         failures += run_full(QType::T2_G128_FP16, "t2-full", hidden,
                              base_scores(QType::T2_G128_FP16, host_hidden));
-        failures += run_indexed(QType::Q4_G64_FP16, "q4-optimized", hidden,
-                                base_scores(QType::Q4_G64_FP16, host_hidden));
+        if (!t2_only) {
+            failures += run_indexed(QType::Q4_G64_FP16, "q4-optimized", hidden,
+                                    base_scores(QType::Q4_G64_FP16, host_hidden));
+        }
         failures += run_indexed(QType::T2_G128_FP16, "t2-indexed", hidden,
                                 base_scores(QType::T2_G128_FP16, host_hidden));
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";

@@ -42,7 +42,9 @@ namespace ninfer::ops {
  *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
  *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], or BF16 Contiguous [5120,6144]. T may
- *   be any positive value.
+ *   be any positive value. T2_G128_FP16 RowSplit uses FP16 scales for 128-element groups and
+ *   registers [N,5120] for N in {1024,4096,6144,7168,12288,14336,16384,34816,131072,248320},
+ *   plus [5120,6144] and [5120,17408].
  *
  * Numeric:
  *   The oracle reads a registered BF16 weight directly or exact-decodes a registered packed
@@ -56,6 +58,8 @@ namespace ninfer::ops {
  * Compute policy:
  *   All policies permit the A16 implementations of Q4, Q5, Q8 and BF16. NVFP4 uses A16 for
  *   A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under AllowA8/AllowA4.
+ *   T2 permits A16 under every policy and may use integer A8 under AllowA8Int,
+ *   AllowA8IntDecode, or AllowPrefillCublas.
  *   Each registration owns its production plan. A permissive policy
  *   allows the private resolver to select either qualified
  *   arithmetic profile; it does not itself prescribe a kernel.
@@ -65,8 +69,9 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_add_workspace_capacity_bytes(), scoped to
- *   the call. A16 routes require no storage; quantized-activation routes use the reported capacity.
- *   There is no persistent state side effect.
+ *   the call. T2 A16 materializes a BF16 projection before adding the residual; its capacity query
+ *   also covers the admitted integer A8 routes. Other registered A16 routes require no storage;
+ *   quantized-activation routes use the reported capacity. There is no persistent state side effect.
  */
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
                 cudaStream_t stream);

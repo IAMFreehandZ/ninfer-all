@@ -13,6 +13,7 @@ enum class WeightFormat : std::uint8_t {
     Q4G64F16S,
     Q5G64F16S,
     Q8G32F16S,
+    T2G128F16S,
 };
 
 // Append new fields at the end. The suites in this directory initialize this aggregate

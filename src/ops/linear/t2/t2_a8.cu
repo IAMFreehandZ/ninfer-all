@@ -1,7 +1,7 @@
 // T2G128 row-split weights with int8 activations. Three registered input widths (the hidden 5120,
 // the attention/GDN mixer output 6144 and the MLP intermediate 17408) and any row count that is a
-// whole number of 128-row blocks (64 with NINFER_T2_A8_TILE=off). Inside the small-T band (T <= 192
-// by default, in launches of at most 32 columns) the ternary small-T kernel of t2_small_t_i8.cuh,
+// whole number of 128-row blocks (64 with NINFER_T2_A8_TILE=off). Inside the small-T band
+// [kT2I8SmallMinTokens, kT2I8SmallMaxTokens], launches of at most 32 columns use t2_small_t_i8.cuh,
 // where the A16 kernels are tensor-rate bound at every width; from t2_a8_min_tokens() up the tile
 // GEMM of t2_prefill_i8.cuh, with T padded to a multiple of 64 and its own activation contract (one
 // binary16 scale per token and 128-wide group). NINFER_T2_A8_TILE=off puts the shared prefill GEMM

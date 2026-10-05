@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ops/device_profile_fixture.h"
 
 #include <cuda_runtime.h>
 
@@ -241,7 +242,8 @@ int run_t2() {
     DevicePackedWeight gate_value(
         quantized_weight::make_patterned_weight(QType::T2_G128_FP16, kParent, kHidden, 157U));
     int failures = 0;
-    for (int t : {1, 2, 4, 8, 9, 16, 17, 33, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
+    for (int t : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 33, 65, 128, 129, 192, 193,
+                 300, 600, 1007, 1024}) {
         failures += run_t2_case(query_key, gate_value, t);
     }
     return failures;
@@ -717,8 +719,9 @@ int run_weight_inputs() {
 int main(int argc, char** argv) {
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
-    if (argc != 1 && !dflash2_only && !inputs_only) {
-        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only]\n";
+    const bool t2_only      = argc == 2 && std::string(argv[1]) == "--t2-only";
+    if (argc != 1 && !dflash2_only && !inputs_only && !t2_only) {
+        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only|--t2-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -726,8 +729,19 @@ int main(int argc, char** argv) {
         return 77;
     }
 
+    try {
+        install_device_profile_fixture_from_env();
+    } catch (const std::exception& error) {
+        std::cerr << "attn_input_proj device profile: " << error.what() << '\n';
+        return 1;
+    }
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
+    if (t2_only) {
+        failures = run_t2();
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj T2\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (!dflash2_only) {
         failures += run_q4_q5();
         failures += run_t2();
