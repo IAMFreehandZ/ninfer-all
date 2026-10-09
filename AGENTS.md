@@ -31,12 +31,11 @@ NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU perfor
 optional layer pipeline across several GPUs on Linux. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
 use the same architecture, binding and execution path.
-This fork targets **`sm_86`** and is tuned on **NVIDIA GeForce RTX 3090** (24 GB), built with
-CUDA 12.8. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090; that is where its schedules,
-route tables and published measurements come from, and none of it is authoritative here -- every
-route table this fork inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an
-upstream tuning constant as a hypothesis until measured on this card. The build environment and the
-compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
+This branch targets **`sm_120a`** on **NVIDIA GeForce RTX 5060 Ti** (16 GB, 36 SMs),
+using CUDA 13.1 through Ubuntu WSL2. Bonsai 2 27B uses the compatible NInfer-all baseline,
+`rk4v4` KV, FP16 GDN state and the measured profile documented in
+[RTX 5060 Ti guide](docs/rtx-5060-ti.md). Other GPUs and their routes are inherited;
+an upstream tuning constant is a hypothesis until measured on the target card.
 
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
 (`--devices`, Linux only; each stage owns whole layers with their KV and state, and the head,
@@ -181,99 +180,33 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 
 ## Local operations
 
-### Windows build environment (RTX 3090 fork host)
+### RTX 5060 Ti through Ubuntu WSL2
 
-Verified 2026-09 by building all 444 targets and running the full 100-test suite. An earlier
-revision of this section was wrong on four points and sent at least one agent down a dead end;
-the corrections are called out at the bottom so anyone reading git history is not re-confused.
+Follow [RTX 5060 Ti guide](docs/rtx-5060-ti.md) for prerequisites, the pinned model and
+WebUI, and the `rtx5060` / `rtx5060-dev` CMake presets. Reuse an existing build tree
+whose cache matches the selected target; inspect its compiler and architecture before
+reconfiguring. Keep local build trees, models, logs and raw profiles out of commits.
 
-**Use the existing `build-ninja/` tree. Do not reconfigure and do not delete it.** It is already
-configured correctly: Release, `CMAKE_CUDA_ARCHITECTURES=86`, `BUILD_TESTING=ON`,
-`NINFER_BUILD_APPS=ON`, FFMPEG resolved through the vcpkg manifest into
-`build-ninja/vcpkg_installed/x64-windows`. Configure on this host is slow; there is nothing to
-gain by redoing it.
+The verified toolchain is CUDA 13.1.115, GCC 15.2.0, CMake 4.2.3, Ninja and Python
+3.11.16. Use a selected Python 3.11 environment such as `.venv/bin/python`, checking
+its version before running tools. The optional formatting hook resolves `python3`
+from the selected environment's PATH.
 
-The one real trap is that **two MSVC toolchains are installed and the wrong one is first on
-PATH**:
-
-| | version | path |
-|---|---|---|
-| VS 2026 Community | MSVC v145 `14.50.35717` | `C:\Program Files\Microsoft Visual Studio\18\Community` |
-| VS 2022 BuildTools | MSVC v143 `14.44.35207` | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools` |
-
-CUDA 12.8 hard-errors on v145 (`C1189: unsupported Microsoft Visual Studio version!`), and
-`nvcc` picks up whatever `cl.exe` PATH offers, which by default is VS 2026. `build-ninja`'s cache
-pins the VS 2022 compiler, so the fix is simply to put that environment in front before building.
-Note the `(x86)` in the path — that is the detail the earlier revision missed when it concluded
-VS 2022 was absent.
-
-From PowerShell, import the VS 2022 BuildTools environment and build:
-
-```powershell
-$vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
-  if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-}
-Set-Location C:\ninfer-fork\ninfer-3090\build-ninja
-cmake --build .                                  # everything
-cmake --build . --target <name>                  # one target
-ctest -j2                                        # full suite, ~70 s
-ctest -R <regex> --output-on-failure             # one test
-```
-
-That import is reliable; the environment it produces builds cleanly. Adding only the compiler's
-`bin` directory to PATH is *not* enough — the standard library headers go missing
-(`fatal error C1083: Cannot open include file: 'cstdint'`), because `INCLUDE` and `LIB` come from
-vcvars too.
-
-For a standalone `.cu` probe outside the build tree, `nvcc` can be driven directly. Git Bash
-mangles MSVC-style flags (`/wd4819` becomes a path), so use PowerShell:
-
-```powershell
-nvcc -O3 -arch=sm_86 -allow-unsupported-compiler probe.cu -o probe.exe
-```
-
-`-allow-unsupported-compiler` is needed there and only there, because a bare `nvcc` invocation
-finds VS 2026 on PATH. It is not needed for the CMake build and is not in the cache.
-
-Other host facts:
-
-- CMake 3.31.3 at `C:\Program Files\CMake`; Ninja 1.11.1 from the Python 3.13 pip install.
-- Profilers are installed: Nsight Systems 2024.6.2 (`nsys.exe` under
-  `target-windows-x64/`) and Nsight Compute 2025.1.0 (`ncu.bat`). `ncu` needs GPU performance
-  counters, which are admin-only by default — run it from an elevated shell rather than changing
-  `RmProfilingAdminOnly`, which needs two reboots and loosens a system-wide setting.
-- Compilation needs no GPU, so building is always possible. **Executing** CUDA tests, benchmarks
-  or perplexity runs needs free VRAM, and the user often has the server loaded — ask before
-  assuming the device is free.
-- `nvcc` writes `.exp`/`.lib` next to any `-o` target; keep probe builds out of the repo root.
-- An untracked `config.bat` in the repo root is a leftover from the earlier, incorrect recipe. It
-  sets up the VS 2026 v145 environment with `-allow-unsupported-compiler` and reconfigures into
-  `build/`. It is not the supported path; prefer `build-ninja` as above.
-
-Corrections to the previous revision of this section, all verified false:
-
-1. "VS 2022 BuildTools is **not** installed, so caches pinning `14.44.35207` are stale —
-   reconfigure fresh." It is installed, under `Program Files (x86)`, and those caches are live and
-   correct. Reconfiguring is the one thing that actually breaks the build here.
-2. "Do not invoke `vcvars64.bat` from a non-interactive shell." The VS 2022 BuildTools vcvars
-   imports cleanly and non-interactively, as above. The variable flood described belongs to the
-   VS 2026 vcvars, not this one.
-3. "FFMPEG is required and was missing." It is provided by the vcpkg manifest and already present
-   in `build-ninja/vcpkg_installed/x64-windows`. No `-DFFMPEG_DIR` is needed.
-4. "Configure must pass `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler`." Not for this build;
-   the cache carries `-Xcompiler=/Zc:__cplusplus` and nothing else, because it uses v143.
+On the measured 16 GiB WSL allocation, four build workers avoid the swap pressure
+seen with unrestricted parallelism. CUDA execution requires free VRAM: inspect GPU
+usage and active processes before tests or benchmarks, and preserve unrelated servers.
+Run GPU performance measurements serially and stop concurrent compilation when it
+could affect the comparison. Native Windows and other GPU builds have separate
+requirements in their existing product guides.
 
 ## Commits
 
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
-Use the selected Python 3.11 interpreter explicitly. On this machine it is
-`/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
-version. Use `python3` only after selecting the maintainer environment or checking its version.
-Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
-`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.1.
+Use the selected Python 3.11 interpreter explicitly. Normal resources for this branch
+are `build/`, `models/bonsai2/Ternary-Bonsai-2-27B-ninfer-v3.ninfer`, its conversion
+report, and local profiling output.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.

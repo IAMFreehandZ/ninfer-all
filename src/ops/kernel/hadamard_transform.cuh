@@ -139,19 +139,19 @@ hadamard_quarter_low_bits(float (&v)[8], const __nv_bfloat16* __restrict__ signs
 }
 
 // The forward transform of one block held by four warps (v = the warp's 256 BF16-rounded inputs,
-// block_signs/out_block at the block's start), `barrier` synchronising the four warps: the signs,
-// the ten butterfly stages, the normalisation and the store.
+// block_signs at the block's start), `barrier` synchronising the four warps: the signs, the ten
+// butterfly stages and the normalisation. Warp w is left with elements 256r + 64w + 2l + k of the
+// normalised FP32 result in t[r][k].
 template <class Barrier>
 __device__ __forceinline__ void
-hadamard_quarter_forward_store(float (&v)[8], const __nv_bfloat16* __restrict__ block_signs,
-                               __nv_bfloat16* __restrict__ out_block, HadamardQuarterShared& shared,
-                               int warp, int lane, Barrier barrier) {
+hadamard_quarter_forward(float (&v)[8], const __nv_bfloat16* __restrict__ block_signs,
+                         HadamardQuarterShared& shared, int warp, int lane, Barrier barrier,
+                         float (&t)[kHadamardQuarterWarps][2]) {
     hadamard_quarter_low_bits(v, block_signs + warp * kWarpSize * 8, lane);
     *reinterpret_cast<float4*>(&shared.v[warp][lane * 8])     = make_float4(v[0], v[1], v[2], v[3]);
     *reinterpret_cast<float4*>(&shared.v[warp][lane * 8 + 4]) = make_float4(v[4], v[5], v[6], v[7]);
     barrier();
     const int e = 64 * warp + 2 * lane;
-    float t[kHadamardQuarterWarps][2];
 #pragma unroll
     for (int r = 0; r < kHadamardQuarterWarps; ++r) {
         const float2 pair = *reinterpret_cast<const float2*>(&shared.v[r][e]);
@@ -176,10 +176,24 @@ hadamard_quarter_forward_store(float (&v)[8], const __nv_bfloat16* __restrict__ 
     }
 #pragma unroll
     for (int r = 0; r < kHadamardQuarterWarps; ++r) {
-        const __nv_bfloat162 packed =
-            __floats2bfloat162_rn(__fmul_rn(t[r][0], kHadamardTransformNormalizer),
-                                  __fmul_rn(t[r][1], kHadamardTransformNormalizer));
-        *reinterpret_cast<__nv_bfloat162*>(out_block + r * kWarpSize * 8 + e) = packed;
+#pragma unroll
+        for (int k = 0; k < 2; ++k) { t[r][k] = __fmul_rn(t[r][k], kHadamardTransformNormalizer); }
+    }
+}
+
+// hadamard_quarter_forward, then the BF16 store of the block at out_block.
+template <class Barrier>
+__device__ __forceinline__ void
+hadamard_quarter_forward_store(float (&v)[8], const __nv_bfloat16* __restrict__ block_signs,
+                               __nv_bfloat16* __restrict__ out_block, HadamardQuarterShared& shared,
+                               int warp, int lane, Barrier barrier) {
+    float t[kHadamardQuarterWarps][2];
+    hadamard_quarter_forward(v, block_signs, shared, warp, lane, barrier, t);
+    const int e = 64 * warp + 2 * lane;
+#pragma unroll
+    for (int r = 0; r < kHadamardQuarterWarps; ++r) {
+        *reinterpret_cast<__nv_bfloat162*>(out_block + r * kWarpSize * 8 + e) =
+            __floats2bfloat162_rn(t[r][0], t[r][1]);
     }
 }
 

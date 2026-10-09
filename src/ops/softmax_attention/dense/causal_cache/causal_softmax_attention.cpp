@@ -63,7 +63,8 @@ bool prompt_nvfp4_fast(KvCacheStorage storage, CausalAttentionExecutionEnvelope 
                        std::int32_t batch_size) {
 #if defined(NINFER_SM120_NVFP4)
     return storage == KvCacheStorage::Nvfp4Group16 && batch_size == 1 &&
-           detail::causal_attention_prompt_fast_kernel(storage, envelope.fast_prompt_kernel) &&
+           detail::causal_attention_prompt_fast_kernel(storage, envelope.fast_prompt_kernel,
+                                                      0, 0, envelope.max_visible_keys) &&
            detail::nvfp4_fast_prompt_applies(envelope.max_visible_keys);
 #else
     (void)storage;
@@ -548,8 +549,9 @@ std::int32_t causal_softmax_attention_prompt_aligned_chunk(AttentionHeadGeometry
     constexpr std::int32_t kGranule = 128;
     if (requested < 2 * kGranule || !kv_cache_is_int8_family(storage)) { return requested; }
     const std::int32_t rows =
-        detail::causal_attention_prompt_fast_kernel(storage, fast_prompt_kernel) ? detail::kPromptWaveRows
-                                                                                 : 64;
+        detail::causal_attention_prompt_fast_kernel(storage, fast_prompt_kernel,
+                                                   geometry.query_heads, requested, 1)
+            ? detail::kPromptWaveRows : 64;
     int device              = 0;
     int multiprocessors     = 0;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -599,10 +601,20 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
     };
+    const bool fast_nvfp4 = prompt_nvfp4_fast(cache_storage, envelope, batch_size);
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::CausalAttentionRoute route = detail::causal_attention_resolve_route(
             q_heads, width, batch_size, cache_storage, envelope);
-        if (route == detail::CausalAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::CausalAttentionRoute::Prompt) {
+            if (!fast_nvfp4) {
+                return detail::causal_attention_prompt_workspace_bytes(
+                    cache_storage, envelope.fast_prompt_kernel, q_heads, width, width,
+                    envelope.max_visible_keys);
+            }
+            const auto plan =
+                detail::rotated_fast_prompt_plan(q_heads, width, envelope.max_visible_keys);
+            return detail::rotated_fast_prompt_split_bytes(q_heads, width, plan.splits);
+        }
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         if (const std::int32_t tile = detail::causal_attention_parallel_tile_width(
@@ -636,19 +648,20 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
-    if (prompt_nvfp4_fast(cache_storage, envelope, batch_size)) {
-        // The fast NVFP4 prompt kernel's split partials: its plan picks the split count from the
-        // visible keys of each launch, so reserve the most any split count within its 64 MiB
-        // budget can take at the widest width rather than the count the envelope's keys select.
-        constexpr std::size_t kSplitBudgetBytes = std::size_t{64} << 20;
-        std::size_t split_bytes                 = 0;
-        for (std::int32_t splits = 2; splits <= 16; ++splits) {
-            const std::size_t bytes =
-                detail::rotated_fast_prompt_split_bytes(q_heads, max_width, splits);
-            if (bytes > kSplitBudgetBytes) { break; }
-            split_bytes = bytes;
-        }
-        maximum = std::max(maximum, split_bytes);
+    if (!fast_nvfp4 && max_width > maximum_verify_tokens) {
+        // Wider single-row calls all take the prompt route.
+        maximum = std::max(maximum, detail::causal_attention_prompt_workspace_bytes(
+                                        cache_storage, envelope.fast_prompt_kernel, q_heads,
+                                        std::max(min_width, maximum_verify_tokens + 1), max_width,
+                                        envelope.max_visible_keys));
+    }
+    if (fast_nvfp4 && max_width > maximum_verify_tokens) {
+        // Wider single-row calls all take the prompt route. Use the execution planner at each
+        // legal width; its selected split count can change at a query-block boundary.
+        maximum = std::max(
+            maximum, detail::rotated_fast_prompt_workspace_bytes(
+                         q_heads, std::max(min_width, maximum_verify_tokens + 1), max_width,
+                         envelope.max_visible_keys));
     }
     return maximum;
 }
@@ -723,7 +736,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 #endif
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                           cache, out, envelope.fast_prompt_kernel, stream);
+                                           cache, out, envelope, workspace, stream);
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
 }
 
@@ -759,8 +772,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     }
 #endif
-    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out,
-                                                     envelope.fast_prompt_kernel, stream);
+    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, envelope,
+                                                     workspace, stream);
 }
 
 } // namespace ninfer::ops

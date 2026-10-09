@@ -43,7 +43,7 @@ endforeach()
 
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops ninfer_runtime_support ninfer_calibration)
 
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
@@ -54,7 +54,24 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops ninfer_runtime_support ninfer_calibration)
+
+ninfer_add_op_test(ninfer_device_profile_fixture_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_device_profile_fixture.cpp"
+  LIBRARIES ninfer_runtime_support ninfer_calibration)
+
+ninfer_add_op_test(ninfer_attention_sampled_oracle_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/test_sampled_oracle.cpp")
+
+add_test(NAME ninfer_softmax_attention_rk4v4_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-only)
+set_tests_properties(ninfer_softmax_attention_rk4v4_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
+
+add_test(NAME ninfer_softmax_attention_rk4v4_fast_prompt_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-fast-prompt-only)
+set_tests_properties(ninfer_softmax_attention_rk4v4_fast_prompt_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
 
 add_test(NAME ninfer_softmax_attention_nvfp4_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --nvfp4-only)
@@ -153,7 +170,7 @@ ninfer_add_op_test(ninfer_speculative_round_test
 
 ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops ninfer_runtime_support ninfer_calibration)
 
 ninfer_add_op_test(ninfer_attn_input_proj_fused_rmsnorm_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj_fused_rmsnorm.cpp"
@@ -162,7 +179,7 @@ set_tests_properties(ninfer_attn_input_proj_fused_rmsnorm_test PROPERTIES SKIP_R
 
 ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops ninfer_runtime_support ninfer_calibration)
 
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
@@ -210,9 +227,25 @@ ninfer_add_op_test(ninfer_route_coverage_test
   LIBRARIES ninfer_ops)
 
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
+target_link_libraries(ninfer_linear_t2_a8_test PRIVATE ninfer_runtime_support ninfer_calibration)
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
+ninfer_add_op_test(ninfer_linear_add_t2_a8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_add/test_t2_a8.cpp"
+  LIBRARIES ninfer_linear_add_test_support ninfer_runtime_support ninfer_calibration)
+set_tests_properties(ninfer_linear_add_t2_a8_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
+ninfer_add_op_test(ninfer_linear_add_t2_swiglu_hadamard_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_add/test_t2_swiglu_hadamard.cpp"
+  LIBRARIES ninfer_ops ninfer_runtime_support ninfer_calibration)
+set_tests_properties(ninfer_linear_add_t2_swiglu_hadamard_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
+
+foreach(projection IN ITEMS attn_input_proj gdn_input_proj linear_topk)
+  add_test(NAME ninfer_${projection}_t2_test
+    COMMAND ninfer_tests ninfer_${projection}_test --t2-only)
+  set_tests_properties(ninfer_${projection}_t2_test
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
+endforeach()
 
 add_test(NAME ninfer_softmax_attention_wide_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --wide-only)
@@ -242,6 +275,13 @@ add_test(NAME ninfer_gdn_state_fp16_two_stage_test
   COMMAND ninfer_tests ninfer_gdn_state_fp16_test 64 --two-stage)
 set_tests_properties(ninfer_gdn_state_fp16_two_stage_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME ninfer_gdn_state_fp16_oracle_test
+  COMMAND ninfer_tests ninfer_gdn_state_fp16_test --oracle-only --two-stage)
+add_test(NAME ninfer_gdn_state_fp16_prefill_oracle_test
+  COMMAND ninfer_tests ninfer_gdn_state_fp16_test --oracle-only --two-stage 1152)
+set_tests_properties(ninfer_gdn_state_fp16_oracle_test ninfer_gdn_state_fp16_prefill_oracle_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 
 add_test(NAME ninfer_gdn_replay_fold_wide_test
   COMMAND ninfer_tests ninfer_gdn_replay_fold_test --wide-only)

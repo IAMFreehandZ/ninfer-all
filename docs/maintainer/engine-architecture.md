@@ -376,6 +376,9 @@ Scheduler 保证：
   `concurrent_prefill`（`--concurrent-prefill`）后，由于 prefill 不持有 resource transaction，
   admission 可以在其它 request prefill 期间进行（仍受 open global topology transition 与 decode
   连续性的门控），多个 request 可以同时处于 staged-prefill 状态；
+- 多个 staged-prefill lane 中，每个 prefill unit 推进剩余 prompt token 最少的可运行 lane（相同时取
+  最低 lane）。不同 request 的 prefill 不合批，这一顺序只改变谁等待，不改变总 prefill 工作量；超越一个
+  prompt 的只能是其它 active lane 中更短的 prompt，每次只持续其自身剩余的 chunk；
 - 已有 decode work 不会被连续 prefill 饿死；
 - decode round 包含所有且仅包含当前 decode-ready requests；
 - batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。

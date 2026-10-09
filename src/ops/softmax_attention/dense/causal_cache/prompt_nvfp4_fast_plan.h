@@ -49,8 +49,8 @@ inline std::size_t rotated_fast_prompt_split_bytes(std::int32_t q_heads, std::in
 // Every CTA of a launch sweeps about the same key range and one CTA fits an SM, so a launch costs
 // about (waves) x (one CTA's sweep); a split CTA sweeps 1/splits of it. A four-warp CTA sweeps in
 // 72 % of an eight-warp CTA's time (RTX 5090, 4096 columns over 128K keys) but covers half the
-// rows. Split partials may use at most 64 MiB, which the workspace plan reserves for the widest
-// launch.
+// rows. Split partials may use at most 64 MiB. Workspace capacity is the maximum selected
+// allocation over the legal width interval.
 inline RotatedFastPromptPlan rotated_fast_prompt_plan(std::int32_t q_heads, std::int32_t width,
                                                       std::uint32_t max_visible_keys) {
     constexpr std::size_t kSplitBudgetBytes  = std::size_t{64} << 20;
@@ -101,7 +101,7 @@ inline bool nvfp4_fast_prompt_applies(std::uint32_t max_visible_keys) {
     return max_visible_keys > 2048;
 }
 
-// Transient bytes of the widest fast prompt launch among widths [first, last].
+// Maximum transient bytes selected by fast prompt launches of width [first, last].
 inline std::size_t rotated_fast_prompt_workspace_bytes(std::int32_t q_heads, std::int32_t first,
                                                        std::int32_t last,
                                                        std::uint32_t max_visible_keys) {

@@ -4,6 +4,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/device_profile_fixture.h"
 
 #include <cuda_runtime.h>
 
@@ -242,7 +243,8 @@ int run_t2() {
         quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 12288, kHidden, 439U));
     int failures = 0;
     for (const std::int32_t tokens :
-         {1, 2, 4, 8, 9, 16, 17, 33, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
+         {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 33, 65, 128, 129, 192, 193,
+          300, 600, 1007, 1024}) {
         failures += run_t2_case(query_key, value_z_weight, tokens);
     }
     return failures;
@@ -532,18 +534,31 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool t2_only = argc == 2 && std::string(argv[1]) == "--t2-only";
+    if (argc != 1 && !t2_only) {
+        std::cerr << "usage: ninfer_gdn_input_proj_test [--t2-only]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
+    try {
+        install_device_profile_fixture_from_env();
+    } catch (const std::exception& error) {
+        std::cerr << "gdn_input_proj device profile: " << error.what() << '\n';
+        return 1;
+    }
     int failures = 0;
-    failures += run_q4_q5();
     failures += run_t2();
-    failures += run_q8();
-    failures += run_nvfp4();
-    failures += run_fp8();
+    if (!t2_only) {
+        failures += run_q4_q5();
+        failures += run_q8();
+        failures += run_nvfp4();
+        failures += run_fp8();
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

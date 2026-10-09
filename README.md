@@ -1,4 +1,17 @@
-# NInfer-all
+# NInfer for RTX 5060 Ti 16 GB
+
+Run Bonsai 2 27B with `rk4v4` KV caching and the bundled chat app through Ubuntu
+WSL2. The [RTX 5060 Ti guide](docs/rtx-5060-ti.md) covers the CUDA 13.1 build,
+model download, measured performance and numerical limits. After building,
+double-click `Start-Bonsai.cmd` to start the server and open the app.
+
+The default uses a 65,536-token context, two requests served at the same time, FP16 GDN
+state, DFlash2 with seven drafts, temperature zero and thinking off. Session and request
+options can override these
+choices. This branch carries the Bonsai-compatible NInfer-all baseline described
+below, plus focused changes for the RTX 5060 Ti.
+
+## Inherited engine and attribution
 
 One line of [NInfer](https://github.com/Neroued/ninfer) for the RTX 3090, RTX 4090, RTX 5090 and RTX
 PRO 6000 Blackwell, consolidated from the forks that carry it and extended with this repository's

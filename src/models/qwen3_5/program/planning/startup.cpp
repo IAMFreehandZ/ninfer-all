@@ -785,7 +785,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     }
                     scratch(layout, ops::linear_topk_workspace_capacity_bytes(
                                         head.weight.qtype, head.weight.n, head.weight.k,
-                                        mask_columns, mask_columns));
+                                        head.policy, mask_columns, mask_columns));
                     matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,

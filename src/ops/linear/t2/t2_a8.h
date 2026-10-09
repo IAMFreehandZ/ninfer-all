@@ -1,10 +1,13 @@
 #pragma once
 
 // Integer-activation routes for T2G128 row-split weights (the codes are exact int8 {-1, 0, +1};
-// the activations are quantised to int8 with one scale per token and 64- or 128-wide group): the
+// the activations are quantised to int8 with one scale per token and 64-wide group, or per token
+// alone on the prefill tile): the
 // small-T kernel of t2_small_t_i8.cuh for T in [kT2I8SmallMinTokens, kT2I8SmallMaxTokens], and
 // above it, from t2_a8_min_tokens() up, the tile GEMM of t2_prefill_i8.cuh, which pads T to a
-// multiple of 64 internally (NINFER_T2_A8_TILE=off: the shared int8 GEMM of
+// multiple of 64 internally, with TMA byte staging on sm_120 for aligned inputs
+// when the build supports by-value tensor-map descriptors
+// (NINFER_T2_A8_TILE=off: the shared int8 GEMM of
 // ops/common/rowsplit_a8_mma.cuh with the ternary codec).
 
 #include "core/arena.h"
@@ -56,6 +59,22 @@ struct T2A8Activations {
 
 [[nodiscard]] T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace,
                                              cudaStream_t stream);
+
+// Whether T takes the prefill tile route, where the paired and transform-fused entries below run.
+[[nodiscard]] bool t2_a8_prefill_tile(std::int32_t tokens);
+// t2_a8_quantize(hadamard_transform(a, signs)) (forward) without materializing the BF16 transform:
+// a BF16 [K, T], signs BF16 [K], validated by the caller, K a registered width and a multiple of
+// 1024, T on the prefill tile. Allocates exactly the planes t2_a8_quantize allocates for T.
+[[nodiscard]] T2A8Activations t2_a8_quantize_hadamard(const Tensor& a, const Tensor& signs,
+                                                      WorkspaceArena& workspace,
+                                                      cudaStream_t stream);
+// out[r, t] = silu_mul of rows r and N / 2 + r of the BF16 projection W @ x, out BF16 [N / 2, T]:
+// the gate and up halves of one weight in a single pass, on the prefill tile only.
+void t2_a8_project_swiglu(const T2A8Activations& x, const Weight& w, Tensor& out,
+                          cudaStream_t stream);
+// residual += W @ x over activations quantised once.
+void t2_a8_project_add(const T2A8Activations& x, const Weight& w, Tensor& residual,
+                       cudaStream_t stream);
 // One pass over a parent weight: rows [0, split) go to first[first_offset + row, t], the rest to
 // second[second_offset + row - split, t].
 void t2_a8_project_split(const T2A8Activations& x, const Weight& w, Tensor& first,

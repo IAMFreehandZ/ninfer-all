@@ -19,11 +19,19 @@ bool rotated_dense(const DenseParameters& p) {
 }
 
 // A Hadamard-rotated Dense FFN projects gate/up into one plane from the rotated input; when down
-// is rotated, silu_mul_hadamard writes its input already in the rotated basis.
+// is rotated, swiglu_hadamard_linear_add runs the whole FFN with the down input in the rotated
+// basis.
 std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t first,
                                           std::int32_t last, bool wide_verification) {
-    const auto& gu   = p.gate_up.weight;
-    const auto& down = p.down.weight;
+    const auto& gu                 = p.gate_up.weight;
+    const auto& down               = p.down.weight;
+    const ops::LinearPolicy policy = residual_projection_policy(p.down, wide_verification);
+    if (rotated(p.down.hadamard_signs)) {
+        return rotated_workspace_bytes(
+            p.gate_up.hadamard_signs, gu.k, last,
+            ops::swiglu_hadamard_linear_add_workspace_capacity_bytes(
+                gu.qtype, gu.n, gu.k, p.gate_up.policy, down.qtype, down.n, policy, first, last));
+    }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {gu.n, last});
     {
@@ -34,33 +42,35 @@ std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t
                                         gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last)));
     }
     (void)layout.alloc(DType::BF16, {gu.n / 2, last});
-    (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-        down.qtype, down.n, down.k, residual_projection_policy(p.down, wide_verification), first,
-        last));
+    (void)layout.alloc_bytes(
+        ops::linear_add_workspace_capacity_bytes(down.qtype, down.n, down.k, policy, first, last));
     return layout.peak_bytes(1);
 }
 
 void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& residual,
                        WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis,
                        bool wide_verification) {
-    const auto columns      = hidden.ne[1];
-    const auto& gu          = p.gate_up.weight;
-    const auto intermediate = gu.n / 2;
-    Tensor plane            = workspace.alloc(DType::BF16, {gu.n, columns});
+    const auto columns             = hidden.ne[1];
+    const auto& gu                 = p.gate_up.weight;
+    const auto intermediate        = gu.n / 2;
+    const ops::LinearPolicy policy = residual_projection_policy(p.down, wide_verification);
+    if (rotated(p.down.hadamard_signs)) {
+        auto call      = workspace.scope();
+        const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream, basis);
+        ops::swiglu_hadamard_linear_add(x, gu, p.gate_up.policy, p.down.hadamard_signs,
+                                        p.down.weight, policy, residual, workspace, stream);
+        return;
+    }
+    Tensor plane = workspace.alloc(DType::BF16, {gu.n, columns});
     {
         auto call      = workspace.scope();
         const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream, basis);
         ops::linear(x, gu, plane, p.gate_up.policy, workspace, stream);
     }
     Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
-    if (rotated(p.down.hadamard_signs)) {
-        ops::silu_mul_hadamard(plane, p.down.hadamard_signs, activation, stream);
-    } else {
-        ops::silu_mul(plane.slice(0, 0, intermediate), plane.slice(0, intermediate, intermediate),
-                      activation, stream);
-    }
-    ops::linear_add(activation, p.down.weight, residual,
-                    residual_projection_policy(p.down, wide_verification), workspace, stream);
+    ops::silu_mul(plane.slice(0, 0, intermediate), plane.slice(0, intermediate, intermediate),
+                  activation, stream);
+    ops::linear_add(activation, p.down.weight, residual, policy, workspace, stream);
 }
 
 } // namespace

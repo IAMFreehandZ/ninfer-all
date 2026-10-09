@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/device_profile_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,12 @@ constexpr ReductionCriterion kA16ScoreCriterion{
     /*relative_l2=*/1.0 / 256.0,
     /*gross_absolute=*/1.0 / 256.0,
     /*gross_relative_to_max_reference=*/2.0 / 256.0,
+};
+// The integer-A8 Linear allowance: s8 activations with one scale per weight group.
+constexpr ReductionCriterion kA8ScoreCriterion{
+    /*relative_l2=*/0.04,
+    /*gross_absolute=*/1.0 / 256.0,
+    /*gross_relative_to_max_reference=*/0.06,
 };
 
 struct FixtureWeight {
@@ -251,7 +258,8 @@ expected_order(const std::array<std::int32_t, N>& rows, const std::vector<std::i
 
 int verify_invocation(const char* profile, std::int32_t columns, const Tensor& ids_tensor,
                       const Tensor& scores_tensor, const std::vector<double>& base_score,
-                      const std::vector<std::pair<float, std::int32_t>>& expected) {
+                      const std::vector<std::pair<float, std::int32_t>>& expected,
+                      const ReductionCriterion& criterion) {
     const std::size_t count = static_cast<std::size_t>(kTopK) * columns;
     const auto ids          = from_device<std::int32_t>(ids_tensor.data, count);
     const auto scores       = from_device<float>(scores_tensor.data, count);
@@ -274,7 +282,7 @@ int verify_invocation(const char* profile, std::int32_t columns, const Tensor& i
         }
     }
     failures += verify_reduction(std::string(profile) + " U=" + std::to_string(columns) + " scores",
-                                 actual_scores, reference_scores, kA16ScoreCriterion);
+                                 actual_scores, reference_scores, criterion);
     return failures;
 }
 
@@ -301,7 +309,7 @@ std::vector<int> test_columns() {
     return result;
 }
 
-int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
+int verify_zero_ties(const FixtureWeight& fixture, ops::LinearPolicy policy, const Tensor* id_map,
                      const std::vector<std::int32_t>* host_map) {
     constexpr int columns = 3;
     DeviceBuffer hidden(static_cast<std::size_t>(kHidden) * columns * 2);
@@ -311,11 +319,13 @@ int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
     Tensor out_ids(ids.data(), DType::I32, {kTopK, columns});
     Tensor out_scores(scores.data(), DType::FP32, {kTopK, columns});
     WorkspaceArena workspace(ops::linear_topk_workspace_capacity_bytes(
-        fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns));
+        fixture.weight.qtype, fixture.weight.n, kHidden, policy, columns, columns));
     if (id_map)
-        ops::linear_topk(x, fixture.weight, *id_map, out_ids, out_scores, workspace, nullptr);
+        ops::linear_topk(x, fixture.weight, policy, *id_map, out_ids, out_scores, workspace,
+                         nullptr);
     else
-        ops::linear_topk(x, fixture.weight, kValidRows, out_ids, out_scores, workspace, nullptr);
+        ops::linear_topk(x, fixture.weight, policy, kValidRows, out_ids, out_scores, workspace,
+                         nullptr);
     cuda_synchronize();
     std::vector<int> expected;
     if (host_map) {
@@ -334,7 +344,8 @@ int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
 }
 
 int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
-             const std::vector<double>& base_score) {
+             const std::vector<double>& base_score, ops::LinearPolicy policy,
+             const ReductionCriterion& criterion) {
     const bool fp8        = qtype == QType::FP8_E4M3FN_ROW_BF16;
     FixtureWeight fixture = fp8 ? make_fp8() : make_rowsplit(qtype, kFullRows);
     for (std::size_t index = 0; index < kFullWinnerRows.size(); ++index) {
@@ -352,7 +363,8 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
 
     const auto expected = expected_order(kFullWinnerRows, nullptr);
     const std::size_t capacity =
-        ops::linear_topk_workspace_capacity_bytes(qtype, kFullRows, kHidden, 1, kMaxColumns);
+        ops::linear_topk_workspace_capacity_bytes(qtype, kFullRows, kHidden, policy, 1,
+                                                  kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
@@ -366,7 +378,7 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
                    "copy input fixture");
         const auto before = from_device<std::uint16_t>(x.data(), x.bytes() / 2);
         const auto exact  = ops::linear_topk_workspace_capacity_bytes(
-            fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns);
+            fixture.weight.qtype, fixture.weight.n, kHidden, policy, columns, columns);
         GuardedDeviceBuffer scratch(exact);
         WorkspaceArena point_workspace(DeviceSpan{scratch.data(), exact});
         Tensor hidden_tensor(x.data(), DType::BF16, {kHidden, columns});
@@ -374,11 +386,11 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
         Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
         out_ids.fill(0xcd);
         out_scores.fill(0xff);
-        ops::linear_topk(hidden_tensor, fixture.weight, kValidRows, ids_tensor, scores_tensor,
-                         point_workspace, nullptr);
+        ops::linear_topk(hidden_tensor, fixture.weight, policy, kValidRows, ids_tensor,
+                         scores_tensor, point_workspace, nullptr);
         cuda_synchronize();
-        failures +=
-            verify_invocation(profile, columns, ids_tensor, scores_tensor, base_score, expected);
+        failures += verify_invocation(profile, columns, ids_tensor, scores_tensor, base_score,
+                                      expected, criterion);
         failures += out_ids.verify_guards("ids tail");
         failures += out_scores.verify_guards("scores tail");
         failures += scratch.verify_guards("workspace tail");
@@ -402,22 +414,23 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
         cuda_check(cudaStreamCreate(&stream), "linear_topk create graph stream");
         replay_graph_twice(
             [&](cudaStream_t captured_stream) {
-                ops::linear_topk(graph_hidden, fixture.weight, kValidRows, graph_ids, graph_scores,
-                                 workspace, captured_stream);
+                ops::linear_topk(graph_hidden, fixture.weight, policy, kValidRows, graph_ids,
+                                 graph_scores, workspace, captured_stream);
             },
             stream);
         cuda_check(cudaStreamDestroy(stream), "linear_topk destroy graph stream");
         failures += verify_invocation(profile, graph_columns, graph_ids, graph_scores, base_score,
-                                      expected);
+                                      expected, criterion);
     }
     failures += graph_scratch.verify_guards("graph workspace tail");
-    failures += verify_zero_ties(fixture, nullptr, nullptr);
+    failures += verify_zero_ties(fixture, policy, nullptr, nullptr);
     return failures;
 }
 
 // An indexed head: the Q4 proposal head, or a T2 shortlist of the same row count.
 int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
-                const std::vector<double>& base_score) {
+                const std::vector<double>& base_score, ops::LinearPolicy policy,
+                const ReductionCriterion& criterion) {
     FixtureWeight fixture = make_rowsplit(qtype, kShortRows);
     for (std::size_t index = 0; index < kShortWinnerRows.size(); ++index) {
         patch_rowsplit_row(fixture, qtype, kShortWinnerRows[index], factor_for(index));
@@ -429,7 +442,8 @@ int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
     const auto expected = expected_order(kShortWinnerRows, &host_map);
 
     const std::size_t capacity =
-        ops::linear_topk_workspace_capacity_bytes(qtype, kShortRows, kHidden, 1, kMaxColumns);
+        ops::linear_topk_workspace_capacity_bytes(qtype, kShortRows, kHidden, policy, 1,
+                                                  kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
@@ -444,7 +458,7 @@ int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
                    "copy input fixture");
         const auto before = from_device<std::uint16_t>(x.data(), x.bytes() / 2);
         const auto exact  = ops::linear_topk_workspace_capacity_bytes(
-            fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns);
+            fixture.weight.qtype, fixture.weight.n, kHidden, policy, columns, columns);
         GuardedDeviceBuffer scratch(exact);
         WorkspaceArena point_workspace(DeviceSpan{scratch.data(), exact});
         Tensor hidden_tensor(x.data(), DType::BF16, {kHidden, columns});
@@ -452,11 +466,11 @@ int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
         Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
         out_ids.fill(0xcd);
         out_scores.fill(0xff);
-        ops::linear_topk(hidden_tensor, fixture.weight, map_tensor, ids_tensor, scores_tensor,
-                         point_workspace, nullptr);
+        ops::linear_topk(hidden_tensor, fixture.weight, policy, map_tensor, ids_tensor,
+                         scores_tensor, point_workspace, nullptr);
         cuda_synchronize();
-        failures +=
-            verify_invocation(profile, columns, ids_tensor, scores_tensor, base_score, expected);
+        failures += verify_invocation(profile, columns, ids_tensor, scores_tensor, base_score,
+                                      expected, criterion);
         failures += out_ids.verify_guards("ids tail");
         failures += out_scores.verify_guards("scores tail");
         failures += scratch.verify_guards("workspace tail");
@@ -480,16 +494,16 @@ int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
         cuda_check(cudaStreamCreate(&stream), "linear_topk create graph stream");
         replay_graph_twice(
             [&](cudaStream_t captured_stream) {
-                ops::linear_topk(graph_hidden, fixture.weight, map_tensor, graph_ids, graph_scores,
-                                 workspace, captured_stream);
+                ops::linear_topk(graph_hidden, fixture.weight, policy, map_tensor, graph_ids,
+                                 graph_scores, workspace, captured_stream);
             },
             stream);
         cuda_check(cudaStreamDestroy(stream), "linear_topk destroy graph stream");
         failures += verify_invocation((std::string(profile) + " graph").c_str(), graph_columns,
-                                      graph_ids, graph_scores, base_score, expected);
+                                      graph_ids, graph_scores, base_score, expected, criterion);
     }
     failures += graph_scratch.verify_guards("graph workspace tail");
-    failures += verify_zero_ties(fixture, &map_tensor, &host_map);
+    failures += verify_zero_ties(fixture, policy, &map_tensor, &host_map);
     if (from_device<std::int32_t>(map.p, host_map.size()) != host_map) {
         std::cerr << "linear_topk modified id map\n";
         ++failures;
@@ -499,27 +513,48 @@ int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool t2_only = argc == 2 && std::string(argv[1]) == "--t2-only";
+    if (argc != 1 && !t2_only) {
+        std::cerr << "usage: ninfer_linear_topk_test [--t2-only]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
+        install_device_profile_fixture_from_env();
         const std::vector<std::uint16_t> host_hidden = make_hidden();
         DeviceBuffer hidden(host_hidden.size() * sizeof(std::uint16_t));
         hidden.copy_from_host(host_hidden.data(), hidden.bytes);
 
         int failures = 0;
-        failures += run_full(QType::Q8_G32_FP16, "q8-full", hidden,
-                             base_scores(QType::Q8_G32_FP16, host_hidden));
-        failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
-                             base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
-        failures += run_full(QType::T2_G128_FP16, "t2-full", hidden,
-                             base_scores(QType::T2_G128_FP16, host_hidden));
-        failures += run_indexed(QType::Q4_G64_FP16, "q4-optimized", hidden,
-                                base_scores(QType::Q4_G64_FP16, host_hidden));
-        failures += run_indexed(QType::T2_G128_FP16, "t2-indexed", hidden,
-                                base_scores(QType::T2_G128_FP16, host_hidden));
+        constexpr auto a16 = ops::LinearPolicy::A16Only;
+        constexpr auto a8  = ops::LinearPolicy::AllowA8Int;
+        if (!t2_only) {
+            failures += run_full(QType::Q8_G32_FP16, "q8-full", hidden,
+                                 base_scores(QType::Q8_G32_FP16, host_hidden), a16,
+                                 kA16ScoreCriterion);
+            failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
+                                 base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden), a16,
+                                 kA16ScoreCriterion);
+        }
+        const auto t2_scores = base_scores(QType::T2_G128_FP16, host_hidden);
+        failures += run_full(QType::T2_G128_FP16, "t2-full", hidden, t2_scores, a16,
+                             kA16ScoreCriterion);
+        if (!t2_only) {
+            failures += run_indexed(QType::Q4_G64_FP16, "q4-optimized", hidden,
+                                    base_scores(QType::Q4_G64_FP16, host_hidden), a16,
+                                    kA16ScoreCriterion);
+        }
+        failures += run_indexed(QType::T2_G128_FP16, "t2-indexed", hidden, t2_scores, a16,
+                                kA16ScoreCriterion);
+        // A ternary head under the integer-A8 policy projects with s8 activations.
+        failures += run_full(QType::T2_G128_FP16, "t2-full-a8", hidden, t2_scores, a8,
+                             kA8ScoreCriterion);
+        failures += run_indexed(QType::T2_G128_FP16, "t2-indexed-a8", hidden, t2_scores, a8,
+                                kA8ScoreCriterion);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

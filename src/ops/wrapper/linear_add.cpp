@@ -1,5 +1,6 @@
 #include "core/layout.h"
 #include "core/weight.h"
+#include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/residual_add.h"
@@ -338,6 +339,72 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     throw std::invalid_argument("linear_add: unsupported weight format");
+}
+
+std::size_t swiglu_hadamard_linear_add_workspace_capacity_bytes(
+    QType gate_up_qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+    LinearPolicy gate_up_policy, QType down_qtype, std::int32_t output_rows,
+    LinearPolicy down_policy, std::int32_t min_tokens, std::int32_t max_tokens) {
+    const std::int32_t intermediate = gate_up_rows / 2;
+    const std::size_t gate_up       = linear_workspace_capacity_bytes(
+        gate_up_qtype, gate_up_rows, input_rows, gate_up_policy, min_tokens, max_tokens);
+    const std::size_t projection = linear_add_workspace_capacity_bytes(
+        down_qtype, output_rows, intermediate, down_policy, min_tokens, max_tokens);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(gate_up);
+    }
+    (void)layout.alloc(DType::BF16, {intermediate, max_tokens});
+    (void)layout.alloc_bytes(projection);
+    return layout.peak_bytes(1);
+}
+
+void swiglu_hadamard_linear_add(const Tensor& x, const Weight& gate_up, LinearPolicy gate_up_policy,
+                                const Tensor& signs, const Weight& down, LinearPolicy down_policy,
+                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
+    validate_policy(gate_up_policy);
+    validate_policy(down_policy);
+    const std::int32_t t = x.ne[1];
+    if (t <= 0) { throw std::invalid_argument("swiglu_hadamard_linear_add: T must be positive"); }
+    if (gate_up.n != 2 * down.k) {
+        throw std::invalid_argument("swiglu_hadamard_linear_add: gate_up must have 2 * down.k rows");
+    }
+    require_tensor(x, DType::BF16, gate_up.k, t, "x");
+    require_tensor(residual_out, DType::BF16, down.n, t, "residual_out");
+    if (overlaps(x, residual_out) || overlaps(signs, residual_out)) {
+        throw std::invalid_argument(
+            "swiglu_hadamard_linear_add: x and signs must not overlap residual_out");
+    }
+    auto scope = ws.scope();
+    if (gate_up.qtype == QType::T2_G128_FP16 && down.qtype == QType::T2_G128_FP16 &&
+        detail::t2_a8_admits(gate_up_policy) && detail::t2_a8_admits(down_policy) &&
+        detail::t2_a8_supported(gate_up, t) && detail::t2_a8_supported(down, t) &&
+        detail::t2_a8_prefill_tile(t) && down.k % 1024 == 0) {
+        // The checks silu_mul_hadamard makes of its sign vector.
+        require_tensor(signs, DType::BF16, down.k, 1, "signs");
+        if (!aligned_to(signs.data, 16)) {
+            throw std::invalid_argument("swiglu_hadamard_linear_add: signs must be 16-byte aligned");
+        }
+        Tensor activation = ws.alloc(DType::BF16, {down.k, t});
+        {
+            auto call = ws.scope();
+            detail::t2_a8_project_swiglu(detail::t2_a8_quantize(x, ws, stream), gate_up, activation,
+                                         stream);
+        }
+        detail::t2_a8_project_add(detail::t2_a8_quantize_hadamard(activation, signs, ws, stream),
+                                  down, residual_out, stream);
+        return;
+    }
+    Tensor plane = ws.alloc(DType::BF16, {gate_up.n, t});
+    {
+        auto call = ws.scope();
+        linear(x, gate_up, plane, gate_up_policy, ws, stream);
+    }
+    Tensor transformed = ws.alloc(DType::BF16, {down.k, t});
+    silu_mul_hadamard(plane, signs, transformed, stream);
+    linear_add(transformed, down, residual_out, down_policy, ws, stream);
 }
 
 } // namespace ninfer::ops

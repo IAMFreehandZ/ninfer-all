@@ -1865,8 +1865,11 @@ A request joins that batch only after its staged prefill finishes; when it compl
 cancelled, the next boundary rebuilds the batch without an empty row. A staged prefill holds
 admission back until it finishes. With `--concurrent-prefill` waiting requests are still admitted
 to free lanes while others prefill, so a new request's admission and prefill overlap the prefill
-and decode of the others (each prefill unit advances one chunk of the lowest staged lane per
-worker boundary).
+and decode of the others. Each prefill unit advances one chunk of the staged request with the
+fewest prompt tokens left (the lowest lane on ties), so a short prompt admitted during a long
+ingest starts generating after its own chunks rather than after the whole long prompt; prefill of
+different requests is not batched, so the order moves waiting between requests without changing
+the total prefill work.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
