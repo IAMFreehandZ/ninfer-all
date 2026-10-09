@@ -184,50 +184,62 @@ int main() {
     failures += check(!scheduler.should_attempt_admission(true, true, true, true, false),
                       "a staged prefill admitted without concurrent prefill");
     scheduler.allow_concurrent_prefill(true);
-    failures +=
-        check(scheduler.owns_prefill_lane(0) && scheduler.select_prefill_lane() == std::optional(0U) &&
-                  scheduler.should_attempt_admission(true, true, true, true, false) &&
-                  !scheduler.should_attempt_admission(true, true, true, false, false) &&
-                  !scheduler.should_attempt_admission(true, true, true, true, true) &&
-                  scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
-                  scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
-              "prefill/decode alternation changed");
+    failures += check(scheduler.owns_prefill_lane(0) &&
+                          scheduler.should_attempt_admission(true, true, true, true, false) &&
+                          !scheduler.should_attempt_admission(true, true, true, false, false) &&
+                          !scheduler.should_attempt_admission(true, true, true, true, true) &&
+                          scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
+                          scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
+                      "prefill/decode alternation changed");
     // Multiple requests may own staged prefill simultaneously; admission stays open while
     // any of them prefill (each unit advances one lane), but an open global topology
     // transition still gates it.
     scheduler.set_prefill_lane(2);
     failures += check(scheduler.prefill_lane_mask() == (1ULL | (1ULL << 2)) &&
-                          scheduler.select_prefill_lane() == std::optional(0U) &&
                           scheduler.has_prefill_lane(),
                       "parallel staged-prefill ownership changed");
     scheduler.clear_prefill_lane(2);
-    failures += check(scheduler.select_prefill_lane() == std::optional(0U),
-                      "lowest staged-prefill lane selection changed");
+    failures += check(scheduler.prefill_lane_mask() == 1ULL, "staged-prefill lane clearing changed");
     scheduler.set_prefill_lane(1);
     scheduler.set_prefill_lane(2);
     {
+        // Each unit advances the runnable lane with the fewest prompt tokens left, lowest lane on
+        // ties; lane 0 owns staged prefill but has no request, so it is never runnable.
         std::array<std::shared_ptr<SchedulerRequest>, 3> slots{};
+        std::array<std::uint64_t, 3> remaining{0, 0, 0};
         const auto runnable = [&](std::uint32_t lane) {
             return slots[lane] != nullptr && !slots[lane]->capture_pending;
         };
-        slots[1]   = std::make_shared<SchedulerRequest>();
-        slots[2]   = std::make_shared<SchedulerRequest>();
+        const auto left = [&](std::uint32_t lane) { return remaining[lane]; };
+        slots[1]     = std::make_shared<SchedulerRequest>();
+        slots[2]     = std::make_shared<SchedulerRequest>();
+        remaining[1] = 30000;
+        remaining[2] = 512;
+        failures += check(scheduler.select_runnable_prefill_lane(3, runnable, left) ==
+                              std::optional(2U),
+                          "staged prefill did not advance the shortest remaining prompt");
+        remaining[2] = 30000;
+        failures += check(scheduler.select_runnable_prefill_lane(3, runnable, left) ==
+                              std::optional(1U),
+                          "equal remaining prompts did not advance the lowest lane");
+        failures += check(scheduler.select_runnable_prefill_lane(2, runnable, left) ==
+                              std::optional(1U),
+                          "staged prefill selected a lane beyond the concurrency bound");
+        remaining[2]              = 512;
+        slots[2]->capture_pending = true;
+        failures += check(scheduler.select_runnable_prefill_lane(3, runnable, left) ==
+                              std::optional(1U),
+                          "runnable staged-prefill lane did not skip a capture owner");
         slots[1]->capture_pending = true;
-        failures +=
-            check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(2U),
-                  "runnable staged-prefill lane skipped a capture owner");
-        slots[1]->capture_pending = false;
-        failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(1U),
-                          "runnable staged-prefill lane selection changed");
-        slots[1]->capture_pending = true;
+        slots[2]->capture_pending = false;
         slots[2].reset();
-        failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::nullopt,
+        failures += check(scheduler.select_runnable_prefill_lane(3, runnable, left) == std::nullopt,
                           "runnable staged-prefill lane selected a freed or capture-owned slot");
     }
     scheduler.clear_prefill_lane(1);
     scheduler.clear_prefill_lane(2);
     scheduler.clear_prefill_lane(0);
-    failures += check(!scheduler.has_prefill_lane() && scheduler.select_prefill_lane() == std::nullopt &&
+    failures += check(!scheduler.has_prefill_lane() &&
                           throws_logic([&] { scheduler.clear_prefill_lane(0); }),
                       "staged-prefill lane clearing changed");
     failures += check(throws_logic([&] { scheduler.set_prefill_lane(8); }),

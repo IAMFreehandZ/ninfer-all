@@ -1844,14 +1844,27 @@ private:
         progress.pending.reset();
     }
 
-    // The lowest lane owning staged prefill that can advance now. A lane offering an active
-    // capture, or whose media item still encodes in a concurrent overlay window, yields its unit.
+    // The staged-prefill lane with the fewest prompt tokens left that can advance now. A lane
+    // offering an active capture, or whose media item still encodes in a concurrent overlay
+    // window, yields its unit.
     [[nodiscard]] std::optional<std::uint32_t> runnable_prefill_lane() const {
-        return scheduler_.select_runnable_prefill_lane(max_concurrency_, [&](std::uint32_t lane) {
-            const auto& request = slots_[lane];
-            return request != nullptr && request->is_prefilling() && !request->capture_pending &&
-                   !(request->sequence && instance_.program->vision_pending(*request->sequence));
-        });
+        return scheduler_.select_runnable_prefill_lane(
+            max_concurrency_,
+            [&](std::uint32_t lane) {
+                const auto& request = slots_[lane];
+                return request != nullptr && request->is_prefilling() &&
+                       !request->capture_pending &&
+                       !(request->sequence && instance_.program->vision_pending(*request->sequence));
+            },
+            [&](std::uint32_t lane) -> std::uint64_t {
+                const auto& request = slots_[lane];
+                if (!request->admitted_begin) {
+                    throw std::logic_error("staged prefill has no committed admission summary");
+                }
+                const BeginSummary& begin = *request->admitted_begin;
+                return static_cast<std::uint64_t>(begin.prompt_tokens) -
+                       begin.reused_prompt_tokens - request->computed_prompt_tokens;
+            });
     }
 
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {

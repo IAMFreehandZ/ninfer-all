@@ -270,27 +270,32 @@ public:
 
     [[nodiscard]] bool has_prefill_lane() const noexcept { return prefill_lanes_ != 0; }
 
-    // Deterministic execution order: lowest lane index first. Prefill units are short
-    // (one chunk), so strictly round-robining by index gives every staged request a fair
-    // share of the single execution stream without tracking per-lane progress.
-    [[nodiscard]] std::optional<std::uint32_t> select_prefill_lane() const noexcept {
-        if (prefill_lanes_ == 0) { return std::nullopt; }
-        return static_cast<std::uint32_t>(std::countr_zero(prefill_lanes_));
-    }
-
-    // Lowest lane owning staged prefill that `runnable(lane)` lets advance now. The caller skips
-    // a lane that must wait, such as one offering an active capture, so it cannot starve the
-    // other lanes.
-    template <class Runnable>
+    // The lane owning staged prefill that `runnable(lane)` lets advance now with the fewest
+    // prompt tokens left (`remaining(lane)`), lowest lane on ties. Prefill units of different
+    // requests are never batched, so the order changes who waits, not the total work:
+    // shortest-remaining first ingests a short prompt admitted during a long one within its own
+    // few chunks instead of behind the whole long prompt, and an ingest that got ahead stays
+    // ahead. Only a shorter prompt in another active lane overtakes, and only for its own
+    // remaining chunks. The caller skips a lane that must wait, such as one offering an active
+    // capture, so it cannot hold back the other lanes.
+    template <class Runnable, class Remaining>
     [[nodiscard]] std::optional<std::uint32_t>
-    select_runnable_prefill_lane(std::uint32_t max_concurrency, Runnable&& runnable) const {
-        std::uint64_t mask = prefill_lanes_;
+    select_runnable_prefill_lane(std::uint32_t max_concurrency, Runnable&& runnable,
+                                 Remaining&& remaining) const {
+        std::optional<std::uint32_t> selected;
+        std::uint64_t selected_remaining = 0;
+        std::uint64_t mask               = prefill_lanes_;
         while (mask != 0) {
             const auto lane = static_cast<std::uint32_t>(std::countr_zero(mask));
             mask &= mask - 1U;
-            if (lane < max_concurrency && runnable(lane)) { return lane; }
+            if (lane >= max_concurrency || !runnable(lane)) { continue; }
+            const std::uint64_t left = remaining(lane);
+            if (!selected || left < selected_remaining) {
+                selected           = lane;
+                selected_remaining = left;
+            }
         }
-        return std::nullopt;
+        return selected;
     }
 
     [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
