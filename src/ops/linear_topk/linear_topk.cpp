@@ -215,8 +215,8 @@ Tensor column_slice(const Tensor& tensor, int first, int columns) {
                   tensor.dtype, {tensor.ne[0], columns});
 }
 
-void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Tensor& ids,
-             Tensor& scores, WorkspaceArena& workspace, cudaStream_t stream) {
+void execute(const Tensor& hidden, const Weight& head, LinearPolicy policy, const Tensor* id_map,
+             Tensor& ids, Tensor& scores, WorkspaceArena& workspace, cudaStream_t stream) {
     const auto profile      = resolve_profile(head.qtype, head.n, head.k);
     const bool materialized = profile == HeadProfile::T2 || profile == HeadProfile::Gguf;
     const int chunk_columns = materialized ? detail::kLinearTopKT2ChunkColumns
@@ -242,8 +242,8 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
                                            stream);
         else if (profile == HeadProfile::T2)
             detail::linear_topk_t2_launch(
-                x, head, id_map != nullptr ? head.n : detail::kLinearTopKFullValidRows, id_map,
-                logits, scratch, stream);
+                x, head, policy, id_map != nullptr ? head.n : detail::kLinearTopKFullValidRows,
+                id_map, logits, scratch, workspace, stream);
         else if (profile == HeadProfile::Gguf) {
             {
                 auto call = workspace.scope();
@@ -262,9 +262,12 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
 } // namespace
 
 std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_rows,
-                                                 std::int32_t input_rows, std::int32_t min_columns,
+                                                 std::int32_t input_rows, LinearPolicy policy,
+                                                 std::int32_t min_columns,
                                                  std::int32_t max_columns) {
     const auto profile = resolve_profile(qtype, head_rows, input_rows);
+    if (!valid_linear_policy(policy))
+        throw std::invalid_argument("linear_topk workspace: invalid policy");
     if (min_columns < 1 || max_columns < min_columns)
         throw std::invalid_argument("linear_topk workspace: invalid column interval");
     WorkspaceLayoutBuilder layout;
@@ -277,6 +280,12 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
         (void)layout.alloc(DType::BF16, {head_rows, columns}, 256);
         (void)detail::allocate_linear_topk_workspace(layout, head_rows, columns, plan.rows,
                                                      plan.tile, plan.block_k);
+        if (profile == HeadProfile::T2) {
+            // The projection's own transient storage sits above the logits and the top-k scratch;
+            // a narrower final chunk needs no more than the widest.
+            (void)layout.alloc_bytes(linear_workspace_capacity_bytes(qtype, head_rows, input_rows,
+                                                                     policy, 1, columns));
+        }
         if (profile == HeadProfile::Gguf) {
             const detail::GgufShape shape{qtype, head_rows, input_rows};
             (void)layout.alloc_bytes(detail::gguf_project_workspace_bytes(
@@ -306,10 +315,11 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
     return layout.peak_bytes();
 }
 
-void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
-                 Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
-                 cudaStream_t stream) {
+void linear_topk(const Tensor& hidden, const Weight& head, LinearPolicy policy,
+                 std::int32_t valid_rows, Tensor& candidate_ids, Tensor& candidate_scores,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
+    if (!valid_linear_policy(policy)) { throw std::invalid_argument("linear_topk: invalid policy"); }
     const HeadProfile profile = resolve_profile(head.qtype, head.n, head.k);
     if (profile == HeadProfile::Q4Optimized || valid_rows != detail::kLinearTopKFullValidRows ||
         head.n != detail::kLinearTopKFullRows) {
@@ -325,13 +335,14 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }
 
-    execute(hidden, head, nullptr, candidate_ids, candidate_scores, workspace, stream);
+    execute(hidden, head, policy, nullptr, candidate_ids, candidate_scores, workspace, stream);
 }
 
-void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
-                 Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
-                 cudaStream_t stream) {
+void linear_topk(const Tensor& hidden, const Weight& head, LinearPolicy policy,
+                 const Tensor& row_to_global_ids, Tensor& candidate_ids, Tensor& candidate_scores,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
+    if (!valid_linear_policy(policy)) { throw std::invalid_argument("linear_topk: invalid policy"); }
     const HeadProfile profile = resolve_profile(head.qtype, head.n, head.k);
     if (profile == HeadProfile::Q4Optimized) {
         require_q4(head);
@@ -348,7 +359,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
         throw std::invalid_argument("linear_topk: id map overlaps input or output");
     }
 
-    execute(hidden, head, &row_to_global_ids, candidate_ids, candidate_scores, workspace, stream);
+    execute(hidden, head, policy, &row_to_global_ids, candidate_ids, candidate_scores, workspace,
+            stream);
 }
 
 } // namespace ninfer::ops

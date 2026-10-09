@@ -1,4 +1,5 @@
-// Public cold-cache benchmark for the three registered linear_topk profiles.
+// Public cold-cache benchmark for the registered linear_topk profiles; the T2 proposal head runs
+// under A16Only and AllowA8Int.
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
@@ -27,6 +28,8 @@ enum class Profile {
     Q8,
     Fp8,
     Q4,
+    T2,
+    T2A8,
 };
 
 __device__ unsigned pattern(unsigned x) {
@@ -65,40 +68,49 @@ __global__ void varied_scales(std::uint16_t* scales, std::uint64_t count, bool b
 const char* profile_name(Profile profile) {
     if (profile == Profile::Q8) { return "q8-full"; }
     if (profile == Profile::Fp8) { return "fp8-full"; }
+    if (profile == Profile::T2) { return "t2-optimized"; }
+    if (profile == Profile::T2A8) { return "t2-optimized-a8"; }
     return "q4-optimized";
 }
 
 void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kTopK   = 16;
-    const std::int32_t rows        = profile == Profile::Q4 ? 131072 : 248320;
+    const bool t2                  = profile == Profile::T2 || profile == Profile::T2A8;
+    const bool indexed             = profile == Profile::Q4 || t2;
+    const std::int32_t rows        = indexed ? 131072 : 248320;
     const QType qtype              = profile == Profile::Q8    ? QType::Q8_G32_FP16
                                      : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16
+                                     : t2                      ? QType::T2_G128_FP16
                                                                : QType::Q4_G64_FP16;
+    const ops::LinearPolicy policy =
+        profile == Profile::T2A8 ? ops::LinearPolicy::AllowA8Int : ops::LinearPolicy::A16Only;
 
     PackedQuantizedWeight packed = profile == Profile::Fp8
                                        ? make_fp8_weight(rows, kHidden)
                                        : make_row_split_weight(qtype, rows, kHidden, kHidden);
-    varied_codes<<<4096, 256>>>(static_cast<std::uint8_t*>(packed.storage.p), packed.low_bytes,
-                                profile);
-    varied_scales<<<1024, 256>>>(
-        reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(packed.storage.p) +
-                                         packed.scale_offset),
-        packed.scale_bytes / 2, profile == Profile::Fp8);
-    CUDA_CHECK(cudaGetLastError());
+    // The RowSplit fill already varies T2 fields and scales.
+    if (!t2) {
+        varied_codes<<<4096, 256>>>(static_cast<std::uint8_t*>(packed.storage.p),
+                                    packed.low_bytes, profile);
+        varied_scales<<<1024, 256>>>(
+            reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(packed.storage.p) +
+                                             packed.scale_offset),
+            packed.scale_bytes / 2, profile == Profile::Fp8);
+        CUDA_CHECK(cudaGetLastError());
+    }
     DeviceBuffer hidden = make_bf16(static_cast<std::size_t>(kHidden) * columns);
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * columns * sizeof(float));
-    DeviceBuffer id_map(
-        profile == Profile::Q4 ? static_cast<std::size_t>(rows) * sizeof(std::int32_t) : 1);
-    if (profile == Profile::Q4) {
+    DeviceBuffer id_map(indexed ? static_cast<std::size_t>(rows) * sizeof(std::int32_t) : 1);
+    if (indexed) {
         std::vector<std::int32_t> host_ids(static_cast<std::size_t>(rows));
         for (std::int32_t row = 0; row < rows; ++row) { host_ids[row] = row; }
         id_map.copy_from_host(host_ids.data(), id_map.bytes);
     }
 
     const std::size_t workspace_bytes =
-        ops::linear_topk_workspace_capacity_bytes(qtype, rows, kHidden, columns, columns);
+        ops::linear_topk_workspace_capacity_bytes(qtype, rows, kHidden, policy, columns, columns);
     WorkspaceArena workspace(workspace_bytes);
     Tensor hidden_tensor(hidden.p, DType::BF16, {kHidden, columns});
     Tensor ids_tensor(ids.p, DType::I32, {kTopK, columns});
@@ -109,12 +121,12 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     const auto launch = [&](cudaStream_t launch_stream) {
-        if (profile == Profile::Q4) {
-            ops::linear_topk(hidden_tensor, packed.weight, map_tensor, ids_tensor, scores_tensor,
-                             workspace, launch_stream);
+        if (indexed) {
+            ops::linear_topk(hidden_tensor, packed.weight, policy, map_tensor, ids_tensor,
+                             scores_tensor, workspace, launch_stream);
         } else {
-            ops::linear_topk(hidden_tensor, packed.weight, 248077, ids_tensor, scores_tensor,
-                             workspace, launch_stream);
+            ops::linear_topk(hidden_tensor, packed.weight, policy, 248077, ids_tensor,
+                             scores_tensor, workspace, launch_stream);
         }
     };
     TimedGraph graph;
@@ -123,7 +135,7 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     const ColdTiming timing    = measure_cold_graph(graph, flush, stream, warmup, repeat);
     const double weight_bytes  = static_cast<double>(packed.model_weight_bytes());
     const double effective_gbs = weight_bytes / timing.median_us / 1000.0;
-    const double useful_tflops = 2.0 * static_cast<double>(profile == Profile::Q4 ? rows : 248077) *
+    const double useful_tflops = 2.0 * static_cast<double>(indexed ? rows : 248077) *
                                  kHidden * columns / timing.median_us / 1.0e6;
     std::printf("%s,%d,%.3f,%.3f,%.3f,%.1f,%.2f,%zu,%zu\n", profile_name(profile), columns,
                 timing.median_us, timing.min_us, timing.p95_us, effective_gbs, useful_tflops,
@@ -135,7 +147,10 @@ Profile parse_profile(std::string_view value) {
     if (value == "q8-full") { return Profile::Q8; }
     if (value == "fp8-full") { return Profile::Fp8; }
     if (value == "q4-optimized") { return Profile::Q4; }
-    throw std::invalid_argument("profile must be q8-full, fp8-full, or q4-optimized");
+    if (value == "t2-optimized") { return Profile::T2; }
+    if (value == "t2-optimized-a8") { return Profile::T2A8; }
+    throw std::invalid_argument(
+        "profile must be q8-full, fp8-full, q4-optimized, t2-optimized or t2-optimized-a8");
 }
 
 } // namespace
@@ -154,7 +169,8 @@ int main(int argc, char** argv) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::printf(
-                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized] [--columns U,...] "
+                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized|t2-optimized|"
+                    "t2-optimized-a8] [--columns U,...] "
                     "[--warmup N] [--repeat N]\n",
                     argv[0]);
                 return 0;
@@ -184,7 +200,7 @@ int main(int argc, char** argv) {
         if (warmup < 0 || repeat < 1) throw std::invalid_argument("invalid timing counts");
         std::vector<Profile> profiles;
         if (profile == "all")
-            profiles = {Profile::Q8, Profile::Fp8, Profile::Q4};
+            profiles = {Profile::Q8, Profile::Fp8, Profile::Q4, Profile::T2, Profile::T2A8};
         else
             profiles = {parse_profile(profile)};
         std::puts(
