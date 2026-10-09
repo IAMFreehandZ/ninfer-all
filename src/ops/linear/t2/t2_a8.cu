@@ -4,8 +4,8 @@
 // [kT2I8SmallMinTokens, kT2I8SmallMaxTokens], launches of at most 32 columns use t2_small_t_i8.cuh,
 // where the A16 kernels are tensor-rate bound at every width; from t2_a8_min_tokens() up the tile
 // GEMM of t2_prefill_i8.cuh, with T padded to a multiple of 64 and its own activation contract (one
-// binary16 scale per token and 128-wide group). NINFER_T2_A8_TILE=off puts the shared prefill GEMM
-// of rowsplit_a8_mma.cuh back on that route for A/B, with T padded to its cheapest column tile.
+// binary16 scale per token). NINFER_T2_A8_TILE=off puts the shared prefill GEMM of
+// rowsplit_a8_mma.cuh back on that route for A/B, with T padded to its cheapest column tile.
 
 #include "ops/linear/t2/t2_a8.h"
 
@@ -13,6 +13,10 @@
 #include "ops/common/device_route.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
 #include "ops/linear/t2/t2_prefill_i8.cuh"
+#include "ops/linear/t2/t2_prefill_hadamard_i8.cuh"
+#if defined(NINFER_SM120_FP8) && !defined(NINFER_TMA_STAGED_DESCRIPTORS)
+#include "ops/linear/t2/t2_prefill_tma_i8.cuh"
+#endif
 #include "ops/linear/t2/t2_small_t_i8.cuh"
 
 #include <cuda_bf16.h>
@@ -144,10 +148,10 @@ void small_gemm(const T2A8Activations& x, SmallColumns span, const SmallParent<E
                                         blocks(*first.weight)};
     const std::int32_t total =
         parents.first_blocks + (second != nullptr ? blocks(*second->weight) : 0);
-    t2_small_t_i8_kernel<Schedule, Epilogue>
-        <<<static_cast<unsigned>(total), Schedule::kThreads, 0, stream>>>(
-            x.codes, x.scales, parents, x.input_rows, span.col0, span.cols);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>(total)), dim3(Schedule::kThreads), 0, stream},
+        t2_small_t_i8_kernel<Schedule, Epilogue>, x.codes, x.scales, parents, x.input_rows,
+        span.col0, span.cols));
 }
 
 // Measured on the RTX 3090 (ninfer_linear_bench, cold L2, 350 W): two code words per lane (256
@@ -226,6 +230,20 @@ void small_route(const T2A8Activations& x, const SmallParent<Epilogue>& first,
         }
     }
 }
+
+// silu_mul of a gate row and its up partner, each first rounded to BF16 as the plane store rounds
+// it, so the result equals the BF16 projection followed by silu_mul.
+struct SwiGluStoreEpilogue {
+    static constexpr bool kPaired = true;
+    __nv_bfloat16* dst;
+    std::int32_t rows;
+
+    __device__ void operator()(std::int32_t row, std::int32_t token, float gate, float up) const {
+        const float g = __bfloat162float(__float2bfloat16(gate));
+        const float u = __bfloat162float(__float2bfloat16(up));
+        dst[static_cast<std::size_t>(token) * rows + row] = __float2bfloat16_rn(silu(g) * u);
+    }
+};
 
 // Rows [0, split) land in `first` and the rest in `second`, each at its own row offset inside a
 // destination of its own height, so one pass over a parent feeds the planes its row ranges belong
@@ -343,17 +361,61 @@ bool tile_rows_fast(std::int32_t output_rows, std::int32_t columns) {
     return forced > 0;
 }
 
+#if defined(NINFER_SM120_FP8) && !defined(NINFER_TMA_STAGED_DESCRIPTORS)
+CUtensorMap prefill_tensor_map(const void* data, int width, int height, int box_width,
+                              int box_height, CUtensorMapSwizzle swizzle) {
+    CUtensorMap map{};
+    const cuuint64_t dimensions[2] = {static_cast<cuuint64_t>(width),
+                                      static_cast<cuuint64_t>(height)};
+    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(width)};
+    const cuuint32_t box[2] = {static_cast<cuuint32_t>(box_width),
+                              static_cast<cuuint32_t>(box_height)};
+    const cuuint32_t steps[2] = {1, 1};
+    const CUresult status = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+        const_cast<void*>(data), dimensions, strides, box, steps, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (status != CUDA_SUCCESS) {
+        const char* message = nullptr;
+        cuGetErrorString(status, &message);
+        throw std::runtime_error(std::string("T2 prefill tensor map: ") +
+                                 (message ? message : "unknown"));
+    }
+    return map;
+}
+
+#endif
+
 template <std::int32_t kCols, class Epilogue>
 void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaStream_t stream) {
     using C                    = T2PrefillI8;
     const std::int32_t columns = tile_columns(x.tokens);
     const bool rows_fast       = tile_rows_fast(w.n, columns);
     const unsigned column_blocks = static_cast<unsigned>(columns / C::kColumns);
-    const unsigned row_blocks    = static_cast<unsigned>(w.n / C::kRows);
+    using Rows                   = T2PrefillRows<Epilogue::kPaired>;
+    const std::int32_t up_offset = Epilogue::kPaired ? w.n / 2 : 0;
+    const unsigned row_blocks =
+        static_cast<unsigned>((Epilogue::kPaired ? w.n / 2 : w.n) / Rows::kOutputRows);
     const dim3 grid = rows_fast ? dim3(row_blocks, column_blocks) : dim3(column_blocks, row_blocks);
+#if defined(NINFER_SM120_FP8) && !defined(NINFER_TMA_STAGED_DESCRIPTORS)
+    // TMA requires aligned global bases and a by-value descriptor ABI. Legal
+    // views without that alignment and staged-descriptor builds use the copy tile.
+    if (((reinterpret_cast<std::uintptr_t>(w.qdata) |
+          reinterpret_cast<std::uintptr_t>(x.codes)) & 127) == 0) {
+        const auto w_map = prefill_tensor_map(w.qdata, kCols / 4, w.n, 32,
+                                              Epilogue::kPaired ? Rows::kHalf : C::kRows,
+                                              CU_TENSOR_MAP_SWIZZLE_NONE);
+        const auto x_map = prefill_tensor_map(x.codes, kCols, columns, 128, 64,
+                                              CU_TENSOR_MAP_SWIZZLE_128B);
+        t2_prefill_tma_i8_kernel<kCols, Epilogue><<<grid, C::kThreads, 0, stream>>>(
+            w_map, x_map, static_cast<const __half*>(w.scales), x.scales, x.tokens, rows_fast,
+            up_offset, epilogue);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
     t2_prefill_i8_kernel<kCols, Epilogue><<<grid, C::kThreads, 0, stream>>>(
         static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales), x.codes,
-        x.scales, columns, x.tokens, rows_fast, epilogue);
+        x.scales, x.tokens, rows_fast, up_offset, epilogue);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -362,16 +424,24 @@ void project(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaS
     if (w.k != x.input_rows || !t2_a8_supported(w, x.tokens)) {
         throw std::invalid_argument("t2 a8: unsupported profile");
     }
-    if (route(x.tokens) == Route::SmallT) {
-        return small_route<Epilogue>(x, {&w, epilogue}, nullptr, stream);
-    }
-    if (prefill_tile()) {
+    if constexpr (Epilogue::kPaired) {
+        // Only the tile GEMM stages gate/up pairs.
+        if (!t2_a8_prefill_tile(x.tokens) || w.n % (2 * T2PrefillI8::kRows) != 0) {
+            throw std::invalid_argument("t2 a8: paired rows need the prefill tile");
+        }
         by_width(w.k, [&]<std::int32_t kCols>() { tile_gemm<kCols>(x, w, epilogue, stream); });
-        return;
+    } else {
+        if (route(x.tokens) == Route::SmallT) {
+            return small_route<Epilogue>(x, {&w, epilogue}, nullptr, stream);
+        }
+        if (prefill_tile()) {
+            by_width(w.k, [&]<std::int32_t kCols>() { tile_gemm<kCols>(x, w, epilogue, stream); });
+            return;
+        }
+        dispatch(w.k, x.tokens, [&]<std::int32_t kCols, int NT>() {
+            gemm<kCols, NT>(w, epilogue, x.tokens, x.codes, x.scales, stream);
+        });
     }
-    dispatch(w.k, x.tokens, [&]<std::int32_t kCols, int NT>() {
-        gemm<kCols, NT>(w, epilogue, x.tokens, x.codes, x.scales, stream);
-    });
 }
 
 template <class Epilogue>
@@ -439,8 +509,7 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
     if (max_tokens >= t2_a8_min_tokens() && prefill_tile()) {
         const std::size_t columns = static_cast<std::size_t>(tile_columns(max_tokens));
         bytes = round(columns * static_cast<std::size_t>(input_rows)) +
-                round(columns * static_cast<std::size_t>(input_rows / T2PrefillI8::kGroupK) *
-                      sizeof(__half));
+                round(columns * sizeof(__half));
     } else if (max_tokens >= t2_a8_min_tokens()) {
         // padded_tokens never exceeds the next multiple of 512, whatever T in [1, max_tokens].
         bytes = a8::activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
@@ -472,10 +541,7 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
         if (widest_tile != 0 && prefill_tile()) {
             const std::size_t columns = static_cast<std::size_t>(tile_columns(widest_tile));
             bytes = std::max(bytes, round(columns * static_cast<std::size_t>(input_rows)) +
-                                        round(columns *
-                                              static_cast<std::size_t>(input_rows /
-                                                                       T2PrefillI8::kGroupK) *
-                                              sizeof(__half)));
+                                        round(columns * sizeof(__half)));
         } else if (widest_tile != 0) {
             bytes = std::max(bytes, a8::activation_workspace_bytes(
                                         input_rows, (widest_tile + 511) / 512 * 512));
@@ -494,9 +560,10 @@ bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input
                               std::int32_t tokens) {
     const Route taken = route(tokens);
     if (taken == Route::None) { return false; }
-    const bool tile          = taken == Route::Prefill && prefill_tile();
-    const std::size_t groups = static_cast<std::size_t>(input_rows) /
-                               (tile ? T2PrefillI8::kGroupK : a8::kGroup);
+    const bool tile = taken == Route::Prefill && prefill_tile();
+    // The tile's activations carry one scale per token, the other routes one per 64-k group.
+    const std::size_t groups =
+        tile ? 1 : static_cast<std::size_t>(input_rows) / static_cast<std::size_t>(a8::kGroup);
     const std::size_t columns = static_cast<std::size_t>(
         taken == Route::SmallT ? tokens : tile ? tile_columns(tokens) : padded_tokens(tokens));
     const std::size_t scale_columns =
@@ -525,10 +592,10 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
         const int groups     = input_rows / kT2I8ActivationK;
         const dim3 grid(static_cast<unsigned>((groups + kWarps - 1) / kWarps),
                         static_cast<unsigned>((tokens + 7) / 8 * 8));
-        t2_small_t_i8_quantize_kernel<<<grid, kWarps * 32, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(x.data), input_rows, tokens, code_data,
-            scale_data);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kWarps * 32), 0, stream},
+                                        t2_small_t_i8_quantize_kernel,
+                                        reinterpret_cast<const __nv_bfloat16*>(x.data), input_rows,
+                                        tokens, code_data, scale_data));
         return {code_data, scale_data, tokens, input_rows};
     }
     if (prefill_tile()) {
@@ -536,15 +603,13 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
         const std::int32_t columns = tile_columns(tokens);
         const std::size_t count    = static_cast<std::size_t>(columns);
         const DeviceSpan codes = workspace.alloc_bytes(count * static_cast<std::size_t>(input_rows));
-        const DeviceSpan scales = workspace.alloc_bytes(
-            count * static_cast<std::size_t>(input_rows / C::kGroupK) * sizeof(__half));
+        const DeviceSpan scales = workspace.alloc_bytes(count * sizeof(__half));
         auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
         auto* scale_data = reinterpret_cast<__half*>(scales.data);
         by_width(input_rows, [&]<std::int32_t kCols>() {
             t2_prefill_i8_quantize_kernel<kCols>
                 <<<static_cast<unsigned>(columns), C::kQuantThreads, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, columns, code_data,
-                    scale_data);
+                    reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, code_data, scale_data);
             CUDA_CHECK(cudaGetLastError());
         });
         return {code_data, scale_data, tokens, input_rows};
@@ -559,6 +624,50 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
         quantize<kCols, NT>(x, tokens, code_data, scale_data, stream);
     });
     return {code_data, scale_data, tokens, input_rows};
+}
+
+bool t2_a8_prefill_tile(std::int32_t tokens) {
+    return route(tokens) == Route::Prefill && prefill_tile();
+}
+
+T2A8Activations t2_a8_quantize_hadamard(const Tensor& a, const Tensor& signs,
+                                        WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t input_rows = a.ne[0];
+    const std::int32_t tokens     = a.ne[1];
+    if (!t2_a8_prefill_tile(tokens) || input_rows % kHadamardTransformBlock != 0 ||
+        !t2_a8_shape_supported(T2PrefillI8::kRows, input_rows)) {
+        throw std::invalid_argument("t2 a8: the fused transform needs the prefill tile");
+    }
+    const std::int32_t columns = tile_columns(tokens);
+    const std::size_t count    = static_cast<std::size_t>(columns);
+    const DeviceSpan codes  = workspace.alloc_bytes(count * static_cast<std::size_t>(input_rows));
+    const DeviceSpan scales = workspace.alloc_bytes(count * sizeof(__half));
+    auto* code_data         = reinterpret_cast<std::int8_t*>(codes.data);
+    auto* scale_data        = reinterpret_cast<__half*>(scales.data);
+    by_width(input_rows, [&]<std::int32_t kCols>() {
+        t2_prefill_hadamard_quantize_kernel<kCols / kHadamardTransformBlock>
+            <<<static_cast<unsigned>(columns), kT2PrefillHadamardThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(a.data),
+                static_cast<const __nv_bfloat16*>(signs.data), tokens, code_data, scale_data);
+        CUDA_CHECK(cudaGetLastError());
+    });
+    return {code_data, scale_data, tokens, input_rows};
+}
+
+void t2_a8_project_swiglu(const T2A8Activations& x, const Weight& w, Tensor& out,
+                          cudaStream_t stream) {
+    if (out.dtype != DType::BF16 || out.data == nullptr || out.ne[0] != w.n / 2 ||
+        out.ne[1] != x.tokens || !out.is_contiguous()) {
+        throw std::invalid_argument("t2 a8 swiglu: out must be a contiguous BF16 [N / 2, T]");
+    }
+    project(x, w, SwiGluStoreEpilogue{reinterpret_cast<__nv_bfloat16*>(out.data), w.n / 2},
+            stream);
+}
+
+void t2_a8_project_add(const T2A8Activations& x, const Weight& w, Tensor& residual,
+                       cudaStream_t stream) {
+    project(x, w, a8::ResidualAddEpilogue{reinterpret_cast<__nv_bfloat16*>(residual.data), w.n},
+            stream);
 }
 
 void t2_a8_project_split(const T2A8Activations& x, const Weight& w, Tensor& first,

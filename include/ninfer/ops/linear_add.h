@@ -79,4 +79,46 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
 
+/**
+ * Returns the transient capacity swiglu_hadamard_linear_add requires for every T in the inclusive
+ * [min_tokens,max_tokens] interval: the composition's BF16 [gate_up_rows, T] plane, linear's
+ * capacity, the BF16 [gate_up_rows / 2, T] transform and linear_add's capacity, for the given
+ * profiles and policies. The fused route needs less.
+ */
+[[nodiscard]] std::size_t swiglu_hadamard_linear_add_workspace_capacity_bytes(
+    QType gate_up_qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+    LinearPolicy gate_up_policy, QType down_qtype, std::int32_t output_rows,
+    LinearPolicy down_policy, std::int32_t min_tokens, std::int32_t max_tokens);
+
+/**
+ * Op: swiglu_hadamard_linear_add
+ *
+ * Math / indexing:
+ *   residual[:,t] += Linear(a, down)[:,t] with a = silu_mul_hadamard(Linear(x, gate_up), signs):
+ *   the Dense SwiGLU FFN of a Hadamard-rotated checkpoint whose down projection takes its input in
+ *   the rotated basis, from the (already rotated) FFN input x.
+ *
+ * Logical shapes:
+ *   x contiguous BF16 [gate_up.k, T]; gate_up [2I, K] holding the gate rows then the up rows;
+ *   signs contiguous BF16 [I] of +1 / -1; down [N, I] with I a multiple of 1024; residual
+ *   contiguous BF16 [N, T]. Each weight is any registration of linear / linear_add.
+ *
+ * Numeric:
+ *   Bit-identical to linear(x, gate_up) into a BF16 [2I, T] plane, silu_mul_hadamard into a BF16
+ *   [I, T] tensor and linear_add, under the given policies. Where both weights are T2 and T takes
+ *   the integer prefill tile, the gate_up tile writes silu_mul of its BF16-rounded gate and up
+ *   rows, and the down projection's input is quantised in the kernel that applies the transform;
+ *   elsewhere the three Ops run in sequence.
+ *
+ * Effects:
+ *   Updates residual in place; x, signs and both weights are preserved and must not overlap it.
+ *
+ * Workspace:
+ *   swiglu_hadamard_linear_add_workspace_capacity_bytes(), scoped to the call. No persistent state
+ *   side effect.
+ */
+void swiglu_hadamard_linear_add(const Tensor& x, const Weight& gate_up, LinearPolicy gate_up_policy,
+                                const Tensor& signs, const Weight& down, LinearPolicy down_policy,
+                                Tensor& residual, WorkspaceArena& ws, cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -21,6 +21,7 @@
 // lane's word looked up in a {0, +1, -2, -1} byte table, on the B side byte permutes of its sixteen
 // activation bytes. The int32 sums of each group are rescaled once per row and column.
 
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/t2/t2_rowsplit_storage.cuh"
@@ -188,6 +189,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_s
             if (next < slabs) { issue(next % kStages, next); }
             cp_commit();
         }
+        // Weights are immutable: the first slabs stream while the producer of x finishes.
+        if (slab == 0) { pdl::wait_for_dependencies(); }
 
         // B: the lane's sixteen activation bytes of each word and live column and the scales of the
         // two output columns its accumulators hold. Both are independent of the staged codes, so
@@ -274,6 +277,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_s
     }
     cp_wait<0>();
     __syncthreads();
+    pdl::trigger_dependents();
 
     // Reduce the K partials of each tile in a fixed order: odd K warps publish, even ones fold
     // their neighbour, then K warp 0 sums the even ones.
@@ -353,6 +357,9 @@ __global__ void t2_small_t_i8_quantize_kernel(const __nv_bfloat16* __restrict__ 
                        (static_cast<int>(threadIdx.x) >> 5);
     const int token  = static_cast<int>(blockIdx.y);
     const int groups = k / kT2I8ActivationK;
+    // Its consumer only stages weights before waiting, so it may launch at once.
+    pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     if (group >= groups) { return; }
     __half* scale = scales + group * kT2I8MaxColumns + token;
     if (token >= tokens) {

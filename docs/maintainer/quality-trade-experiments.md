@@ -332,3 +332,5 @@ than an accident of the schedule. `tools/w4a8_real_weight_probe.cu` measures a p
 what Marlin and the vLLM stacks use -- at 1.2e-2 relative L2 rising to **1.29e-1** as outlier
 channels grow, against 9e-3 to 2.0e-2 for a scale per group of 64. It is about 20% faster and it is
 not worth it here; a single large channel otherwise starves every other channel in the token.
+The T2 prefill tile does use a per-token scale. Its inputs are all Hadamard-rotated, which spreads
+the outlier channels; the evidence is in the [RTX 5060 Ti guide](../rtx-5060-ti.md).

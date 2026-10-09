@@ -5,6 +5,7 @@
 // BF16 exactly as that op stores them, and hands them to hadamard_quarter_forward_store, so the
 // fused output is bit-identical to the op followed by hadamard_transform.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -34,6 +35,9 @@ __launch_bounds__(kRmsnormHadamardThreads) __global__
                                       const __nv_bfloat16* __restrict__ signs,
                                       __nv_bfloat16* __restrict__ out, std::int64_t rows,
                                       float eps) {
+    // Short producer: its dependents may launch at once and wait for it.
+    pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     constexpr int kBlock          = 256;
     constexpr int kWidth          = kRmsnormHadamardWidth;
     constexpr int kPairs          = kWidth / 2;
@@ -107,6 +111,9 @@ __launch_bounds__(kGatedRmsnormHadamardRowsPerCta* kWarpSize) __global__
                                             __nv_bfloat16* __restrict__ out,
                                             std::int32_t heads_per_column, std::int64_t rows,
                                             float eps) {
+    // Short producer: its dependents may launch at once and wait for it.
+    pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     constexpr int kD               = kGatedRmsnormHadamardHeadDim;
     constexpr int kPairs           = kD / 2;
     constexpr int kMaxPairsPerLane = 4;
@@ -190,6 +197,9 @@ __launch_bounds__(kHadamardQuarterWarps* kWarpSize) __global__
                                           const __nv_bfloat16* __restrict__ signs,
                                           __nv_bfloat16* __restrict__ out, std::int64_t items,
                                           std::int32_t blocks_per_column) {
+    // Short producer: its dependents may launch at once and wait for it.
+    pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     __shared__ HadamardQuarterShared shared;
     const int lane          = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp          = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -223,6 +233,9 @@ __launch_bounds__(kHadamardQuarterWarps* kWarpSize) __global__
                                              const __nv_bfloat16* __restrict__ signs,
                                              __nv_bfloat16* out, std::int64_t items,
                                              std::int32_t blocks_per_column) {
+    // Short producer: its dependents may launch at once and wait for it.
+    pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     __shared__ HadamardQuarterShared shared;
     const int lane          = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp          = static_cast<int>(threadIdx.x) / kWarpSize;

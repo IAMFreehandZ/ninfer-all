@@ -233,6 +233,10 @@ ninfer_add_op_test(ninfer_linear_add_t2_a8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_add/test_t2_a8.cpp"
   LIBRARIES ninfer_linear_add_test_support ninfer_runtime_support ninfer_calibration)
 set_tests_properties(ninfer_linear_add_t2_a8_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
+ninfer_add_op_test(ninfer_linear_add_t2_swiglu_hadamard_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_add/test_t2_swiglu_hadamard.cpp"
+  LIBRARIES ninfer_ops ninfer_runtime_support ninfer_calibration)
+set_tests_properties(ninfer_linear_add_t2_swiglu_hadamard_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 

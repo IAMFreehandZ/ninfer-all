@@ -41,12 +41,11 @@ void silu_mul_hadamard_launch(const Tensor& plane, const Tensor& signs, Tensor& 
     if (items > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("silu_mul_hadamard: grid exceeds the CUDA launch limit");
     }
-    silu_mul_hadamard_quarter_kernel<<<static_cast<unsigned>(items),
-                                       kHadamardQuarterWarps * kWarpSize, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(plane.data),
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>(items)), dim3(kHadamardQuarterWarps * kWarpSize), 0, stream},
+        silu_mul_hadamard_quarter_kernel, static_cast<const __nv_bfloat16*>(plane.data),
         static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data), items,
-        blocks_per_column);
-    CUDA_CHECK(cudaGetLastError());
+        blocks_per_column));
 }
 
 void rmsnorm_hadamard_5120_launch(const Tensor& x, const Tensor& weight, float eps,
@@ -60,16 +59,15 @@ void rmsnorm_hadamard_5120_launch(const Tensor& x, const Tensor& weight, float e
     const auto* w2 = static_cast<const __nv_bfloat162*>(weight.data);
     const auto* s  = static_cast<const __nv_bfloat16*>(signs.data);
     auto* o        = static_cast<__nv_bfloat16*>(out.data);
+    const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(rows)),
+                                   dim3(kRmsnormHadamardThreads), 0, stream};
     if (unit_offset) {
-        rmsnorm_hadamard_5120_kernel<RmsEpilogue::Offset>
-            <<<static_cast<unsigned>(rows), kRmsnormHadamardThreads, 0, stream>>>(x2, w2, s, o,
-                                                                                  rows, eps);
+        CUDA_CHECK(pdl::launch_consumer(launch, rmsnorm_hadamard_5120_kernel<RmsEpilogue::Offset>,
+                                        x2, w2, s, o, rows, eps));
     } else {
-        rmsnorm_hadamard_5120_kernel<RmsEpilogue::Plain>
-            <<<static_cast<unsigned>(rows), kRmsnormHadamardThreads, 0, stream>>>(x2, w2, s, o,
-                                                                                  rows, eps);
+        CUDA_CHECK(pdl::launch_consumer(launch, rmsnorm_hadamard_5120_kernel<RmsEpilogue::Plain>,
+                                        x2, w2, s, o, rows, eps));
     }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 void gated_rmsnorm_hadamard_d128_launch(const Tensor& x, const Tensor& weight, const Tensor& z,
@@ -81,12 +79,13 @@ void gated_rmsnorm_hadamard_d128_launch(const Tensor& x, const Tensor& weight, c
     if (ctas > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("gated_rmsnorm_hadamard: grid exceeds the CUDA launch limit");
     }
-    gated_rmsnorm_hadamard_d128_kernel<<<static_cast<unsigned>(ctas),
-                                         kGatedRmsnormHadamardRowsPerCta * kWarpSize, 0, stream>>>(
-        static_cast<const __nv_bfloat162*>(x.data), static_cast<const __nv_bfloat162*>(weight.data),
-        static_cast<const __nv_bfloat162*>(z.data), static_cast<const __nv_bfloat16*>(signs.data),
-        static_cast<__nv_bfloat16*>(out.data), heads_per_column, rows, eps);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>(ctas)), dim3(kGatedRmsnormHadamardRowsPerCta * kWarpSize), 0,
+         stream},
+        gated_rmsnorm_hadamard_d128_kernel, static_cast<const __nv_bfloat162*>(x.data),
+        static_cast<const __nv_bfloat162*>(weight.data), static_cast<const __nv_bfloat162*>(z.data),
+        static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data),
+        heads_per_column, rows, eps));
 }
 
 void sigmoid_mul_hadamard_launch(const Tensor& gate, const Tensor& x, const Tensor& signs,
@@ -97,12 +96,11 @@ void sigmoid_mul_hadamard_launch(const Tensor& gate, const Tensor& x, const Tens
     if (items > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("sigmoid_mul_hadamard: grid exceeds the CUDA launch limit");
     }
-    sigmoid_mul_hadamard_quarter_kernel<<<static_cast<unsigned>(items),
-                                          kHadamardQuarterWarps * kWarpSize, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data), items,
-        blocks_per_column);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>(items)), dim3(kHadamardQuarterWarps * kWarpSize), 0, stream},
+        sigmoid_mul_hadamard_quarter_kernel, static_cast<const __nv_bfloat16*>(gate.data),
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(signs.data),
+        static_cast<__nv_bfloat16*>(out.data), items, blocks_per_column));
 }
 
 void embedding_rotated_t2_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
