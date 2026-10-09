@@ -5,8 +5,9 @@ WSL2. The [RTX 5060 Ti guide](docs/rtx-5060-ti.md) covers the CUDA 13.1 build,
 model download, measured performance and numerical limits. After building,
 double-click `Start-Bonsai.cmd` to start the server and open the app.
 
-The default uses a 65,536-token context, FP16 GDN state, DFlash2 with seven drafts,
-temperature zero and thinking off. Session and request options can override these
+The default uses a 65,536-token context, two requests served at the same time, FP16 GDN
+state, DFlash2 with seven drafts, temperature zero and thinking off. Session and request
+options can override these
 choices. This branch carries the Bonsai-compatible NInfer-all baseline described
 below, plus focused changes for the RTX 5060 Ti.
 

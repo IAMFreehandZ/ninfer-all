@@ -17,13 +17,19 @@ function Assert-Throws([scriptblock]$Action, [string]$Pattern) {
     throw "FAIL: expected error matching $Pattern"
 }
 
+Assert-Equal (ConvertTo-NInferWslPath '\\wsl.localhost\Ubuntu\home\linux user\models\Bonsai 2.ninfer') '/home/linux user/models/Bonsai 2.ninfer' 'native WSL model path preserves spaces'
+Assert-Equal (ConvertTo-NInferWslPath '\\wsl$\Ubuntu\home\linux user\models\Bonsai 2.ninfer') '/home/linux user/models/Bonsai 2.ninfer' 'Windows WSL share name maps to the same native model'
+Assert-Equal (ConvertTo-NInferWslPath '\\wsl.localhost\Ubuntu-24.04\home\models\Bonsai.ninfer' -Distribution 'Ubuntu-24.04') '/home/models/Bonsai.ninfer' 'explicit distribution owns the native model path'
+Assert-Throws { ConvertTo-NInferWslPath '\\wsl.localhost\Debian\home\models\Bonsai.ninfer' -Distribution Ubuntu } 'distribution'
+Assert-Throws { ConvertTo-NInferWslPath '\\fileserver\models\Bonsai.ninfer' } 'path'
+
 $fixture = Join-Path $env:TEMP ('ninfer launcher ' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path (Join-Path $fixture 'build/apps'), (Join-Path $fixture 'models/bonsai2') -Force | Out-Null
 try {
     Set-Content -LiteralPath (Join-Path $fixture 'build/apps/ninfer-serve') -Value ''
     Set-Content -LiteralPath (Join-Path $fixture 'models/bonsai2/Ternary-Bonsai-2-27B-ninfer-v3.ninfer') -Value ''
     $plan = Get-NInferLaunchPlan -Root $fixture
-    Assert-Equal $plan.ServerArguments @($plan.ModelPath, '--host', '127.0.0.1', '--port', '8080', '--model-id', 'bonsai2-27b', '--max-context', '65536', '--max-concurrency', '1', '--kv-dtype', 'rk4v4', '--gdn-state-fp16', '--spec', 'dflash2', '--draft-tokens', '7', '--lm-head-draft', '--temperature', '0', '--no-thinking') 'default serving arguments'
+    Assert-Equal $plan.ServerArguments @($plan.ModelPath, '--host', '127.0.0.1', '--port', '8080', '--model-id', 'bonsai2-27b', '--max-context', '65536', '--max-concurrency', '2', '--kv-dtype', 'rk4v4', '--gdn-state-fp16', '--kv-capacity', '131072', '--concurrent-prefill', '--cuda-graph-allowance-mib', '256', '--spec', 'dflash2', '--draft-tokens', '7', '--lm-head-draft', '--temperature', '0', '--no-thinking') 'default serving arguments'
     Assert-Equal ($plan.ServerArguments -contains '--greedy') $false 'server temperature default preserves per-request sampling overrides'
     $thinkingPlan = Get-NInferLaunchPlan -Root $fixture -Temperature 0.7 -Thinking
     Assert-Equal $thinkingPlan.ServerArguments[-2..-1] @('--temperature', '0.7') 'explicit temperature and thinking arguments'
@@ -63,6 +69,17 @@ try {
     Assert-Throws { Get-NInferLaunchPlan -Root $fixture -Context 0 } 'Context|range|validation'
     Assert-Throws { Get-NInferLaunchPlan -Root $fixture -Port 65536 } 'Port|range|validation'
     Assert-Throws { Get-NInferLaunchPlan -Root $fixture -DraftTokens 16 } 'DraftTokens|range|validation'
+    $single = Get-NInferLaunchPlan -Root $fixture -Concurrency 1
+    Assert-Equal $single.ServerArguments[10] '1' 'explicit single-request concurrency'
+    Assert-Equal ($single.ServerArguments -contains '--kv-capacity') $false 'single request keeps the KV pool at its context'
+    Assert-Equal ($single.ServerArguments -contains '--concurrent-prefill') $false 'single request omits concurrent prefill'
+    Assert-Equal $single.ServerArguments[14..15] @('--cuda-graph-allowance-mib', '128') 'single-request graph allowance'
+    $longPair = Get-NInferLaunchPlan -Root $fixture -Context 262144
+    Assert-Equal $longPair.ServerArguments[14..15] @('--kv-capacity', '262144') 'concurrent KV pool stops at the single-request maximum'
+    $four = Get-NInferLaunchPlan -Root $fixture -Context 32768 -Concurrency 4
+    Assert-Equal $four.ServerArguments[14..18] @('--kv-capacity', '131072', '--concurrent-prefill', '--cuda-graph-allowance-mib', '512') 'four requests share four contexts'
+    Assert-Throws { Get-NInferLaunchPlan -Root $fixture -Concurrency 0 } 'Concurrency|range|validation'
+    Assert-Throws { Get-NInferLaunchPlan -Root $fixture -Concurrency 9 } 'Concurrency|range|validation'
     Remove-Item -LiteralPath (Join-Path $fixture 'build/apps/ninfer-serve')
     Assert-Throws { Get-NInferLaunchPlan -Root $fixture } 'server.*missing|missing.*server'
     Set-Content -LiteralPath (Join-Path $fixture 'build/apps/ninfer-serve') -Value ''
@@ -194,6 +211,7 @@ pathlib.Path(__file__).with_suffix('.arguments.json').write_text(json.dumps(sys.
 # Deliberately require the lifetime guard's KILL fallback after TERM.
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if pathlib.Path(__file__).with_suffix('.delay').exists(): time.sleep(30)
+print('fixture server log line', file=sys.stderr, flush=True)
 server = http.server.HTTPServer(('127.0.0.1', port), Handler)
 try: server.serve_forever()
 finally: server.server_close()
@@ -239,6 +257,12 @@ finally: server.server_close()
             if ($ownedWsl.Count -ne 1) { throw "FAIL: expected one owned WSL process, got $($ownedWsl.Count)." }
             $ownedLinuxPid = (Get-Content -LiteralPath $currentPidFile.FullName -Raw).Trim()
             if ($exitMode -ne 'forced-startup') {
+                # The launcher's console shows the server log as it is written.
+                $logDeadline = (Get-Date).AddSeconds(10)
+                while ((Get-Content -LiteralPath $ownerOut -Raw) -notmatch 'fixture server log line' -and (Get-Date) -lt $logDeadline) {
+                    Start-Sleep -Milliseconds 200
+                }
+                Assert-Equal ((Get-Content -LiteralPath $ownerOut -Raw) -match 'fixture server log line') $true 'launcher console mirrors the server log'
                 $actualServerArguments = Get-Content -LiteralPath ([IO.Path]::ChangeExtension($httpFixture, '.arguments.json')) -Raw | ConvertFrom-Json
                 $contextIndex = [array]::IndexOf($actualServerArguments, '--max-context')
                 Assert-Equal $actualServerArguments[$contextIndex + 1] '65536' 'external script forwards the documented default context to the WSL server'

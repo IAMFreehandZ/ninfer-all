@@ -2,8 +2,10 @@
 .SYNOPSIS
 Runs Ternary Bonsai 2 27B on the RTX 5060 Ti through Ubuntu WSL2.
 .DESCRIPTION
-Keep this terminal open while using the app. Press Ctrl+C to stop the server.
+Keep this terminal open while using the app; it shows the server log, which is also saved under logs\launch. Press Ctrl+C to stop the server.
 Requires the existing WSL build and model; launch does no setup or downloads.
+.PARAMETER Concurrency
+Requests served at the same time, 1 to 8. Default 2. They share one KV pool of Concurrency times Context tokens, at most 262144.
 .PARAMETER FastPrefill
 Opts into the alternate prefill kernel, which can improve prefill throughput and reduce decode throughput.
 .PARAMETER Temperature
@@ -17,6 +19,7 @@ Enable model thinking by default. Thinking can delay the visible answer; request
 param(
     [string]$Root = '',
     [ValidateRange(1, 262144)][int]$Context = 65536,
+    [ValidateRange(1, 8)][int]$Concurrency = 2,
     [ValidateSet('none', 'mtp', 'dflash2')][string]$Spec = 'dflash2',
     [ValidateRange(1, 15)][int]$DraftTokens = 7,
     [ValidateRange(1, 65535)][int]$Port = 8080,
@@ -33,10 +36,16 @@ param(
 # Windows PowerShell binds script parameters before populating PSScriptRoot.
 if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 
-function ConvertTo-NInferWslPath([string]$Path) {
+function ConvertTo-NInferWslPath([string]$Path, [string]$Distribution = 'Ubuntu') {
     $absolute = [IO.Path]::GetFullPath($Path)
+    if ($absolute -match '^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)(\\.*)$') {
+        if ($Matches[1] -ne $Distribution) {
+            throw "WSL path belongs to distribution '$($Matches[1])'; selected distribution is '$Distribution'."
+        }
+        return $Matches[2].Replace('\', '/')
+    }
     if ($absolute -notmatch '^([A-Za-z]):\\(.*)$') {
-        throw "Use a local Windows drive path for WSL launch: $Path"
+        throw "Use a local Windows drive or WSL share path for WSL launch: $Path"
     }
     return '/mnt/' + $Matches[1].ToLowerInvariant() + '/' + $Matches[2].Replace('\', '/')
 }
@@ -62,6 +71,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
@@ -70,6 +80,7 @@ namespace NInferLauncher {
         private SafeFileHandle handle;
         private FileStream stdout, stderr;
         private Task stdoutCopy, stderrCopy;
+        private readonly object consoleLock = new object();
 
         [StructLayout(LayoutKind.Sequential)]
         private struct BasicLimits {
@@ -139,8 +150,8 @@ namespace NInferLauncher {
                 process.Start();
                 started = true;
                 Assign(process);
-                stdoutCopy = process.StandardOutput.BaseStream.CopyToAsync(stdout);
-                stderrCopy = process.StandardError.BaseStream.CopyToAsync(stderr);
+                stdoutCopy = Mirror(process.StandardOutput.BaseStream, stdout);
+                stderrCopy = Mirror(process.StandardError.BaseStream, stderr);
                 process.StandardInput.NewLine = "\n";
                 process.StandardInput.WriteLine("start");
                 process.StandardInput.Flush();
@@ -150,6 +161,22 @@ namespace NInferLauncher {
                 if (started && !process.HasExited) { process.Kill(); process.WaitForExit(); }
                 process.Dispose();
                 throw;
+            }
+        }
+        // Writes a server stream to its log file and to this console as it arrives, so the
+        // terminal shows the server log live.
+        private async Task Mirror(Stream source, FileStream log) {
+            var buffer = new byte[8192];
+            var decoder = new UTF8Encoding(false).GetDecoder();
+            var text = new char[Encoding.UTF8.GetMaxCharCount(buffer.Length)];
+            int read;
+            while ((read = await source.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+                await log.WriteAsync(buffer, 0, read).ConfigureAwait(false);
+                int count = decoder.GetChars(buffer, 0, read, text, 0);
+                lock (consoleLock) {
+                    Console.Out.Write(text, 0, count);
+                    Console.Out.Flush();
+                }
             }
         }
         public void FlushLogs() {
@@ -177,9 +204,11 @@ function Get-NInferLaunchPlan {
     param(
         [string]$Root = '',
         [ValidateRange(1, 262144)][int]$Context = 65536,
+        [ValidateRange(1, 8)][int]$Concurrency = 2,
         [ValidateSet('none', 'mtp', 'dflash2')][string]$Spec = 'dflash2',
         [ValidateRange(1, 15)][int]$DraftTokens = 7,
         [ValidateRange(1, 65535)][int]$Port = 8080,
+        [string]$Distribution = 'Ubuntu',
         [string]$Model = '',
         [string]$Server = '',
         [ValidateRange(0.0, 2.0)][ValidateScript({ -not [double]::IsNaN($_) })][double]$Temperature = 0,
@@ -198,9 +227,18 @@ function Get-NInferLaunchPlan {
     if (-not (Test-Path -LiteralPath $Model -PathType Leaf)) {
         throw "Bonsai model is missing: $Model. Restore the model file or pass -Model with its exact path."
     }
-    $modelPath = ConvertTo-NInferWslPath $Model
+    $modelPath = ConvertTo-NInferWslPath $Model -Distribution $Distribution
     $arguments = @($modelPath, '--host', '127.0.0.1', '--port', "$Port", '--model-id', 'bonsai2-27b',
-        '--max-context', "$Context", '--max-concurrency', '1', '--kv-dtype', 'rk4v4', '--gdn-state-fp16')
+        '--max-context', "$Context", '--max-concurrency', "$Concurrency", '--kv-dtype', 'rk4v4', '--gdn-state-fp16')
+    # Concurrent requests share one KV pool. At most 262144 tokens keeps it within the measured
+    # single-request footprint; requests that do not fit together wait in the queue.
+    if ($Concurrency -gt 1) {
+        $arguments += @('--kv-capacity', "$([Math]::Min([long]$Concurrency * $Context, 262144))", '--concurrent-prefill')
+    }
+    # Startup measured 32-41 MiB of CUDA graphs for one request and 77-85 MiB for two against a
+    # computed 960 MiB per request, so a fixed 128 MiB per request returns that reservation to
+    # the free memory left beside the KV pool.
+    $arguments += @('--cuda-graph-allowance-mib', "$(128 * $Concurrency)")
     if ($Spec -ne 'none') {
         $arguments += @('--spec', $Spec, '--draft-tokens', "$DraftTokens", '--lm-head-draft')
     }
@@ -209,7 +247,7 @@ function Get-NInferLaunchPlan {
     if ($FastPrefill) { $arguments += '--fast-prefill-kernel' }
     [pscustomobject]@{
         Root = $rootPath
-        ServerPath = ConvertTo-NInferWslPath $Server
+        ServerPath = ConvertTo-NInferWslPath $Server -Distribution $Distribution
         ModelPath = $modelPath
         ServerArguments = $arguments
         Url = "http://localhost:$Port"
@@ -244,12 +282,12 @@ function Invoke-NInferLauncher {
     $stdout = Join-Path $logDirectory 'server.stdout.log'
     $stderr = Join-Path $logDirectory 'server.stderr.log'
     $arguments = @('--distribution', $Distribution, '--exec', '/usr/bin/setsid', '--wait', '/bin/bash',
-        (ConvertTo-NInferWslPath $wrapper), (ConvertTo-NInferWslPath $pidFile), $Plan.ServerPath) + $Plan.ServerArguments
+        (ConvertTo-NInferWslPath $wrapper -Distribution $Distribution), (ConvertTo-NInferWslPath $pidFile -Distribution $Distribution), $Plan.ServerPath) + $Plan.ServerArguments
     $process = $null
     $job = $null
     try {
         $job = New-NInferProcessJob
-        Write-Host "Starting Bonsai 2 at $($Plan.Url). Logs: $logDirectory"
+        Write-Host "Starting Bonsai 2 at $($Plan.Url). The server log follows and is saved in $logDirectory"
         Write-Host 'Keep this terminal open. Press Ctrl+C to stop the server and release GPU memory.'
         $process = $job.Start($wsl.Source, (ConvertTo-NInferWindowsArguments $arguments), $stdout, $stderr)
         $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
@@ -295,7 +333,7 @@ function Invoke-NInferLauncher {
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference = 'Stop'
     try {
-        $plan = Get-NInferLaunchPlan -Root $Root -Context $Context -Spec $Spec -DraftTokens $DraftTokens -Port $Port -Model $Model -Server $Server -Temperature $Temperature -Thinking:$Thinking -FastPrefill:$FastPrefill
+        $plan = Get-NInferLaunchPlan -Root $Root -Context $Context -Concurrency $Concurrency -Spec $Spec -DraftTokens $DraftTokens -Port $Port -Distribution $Distribution -Model $Model -Server $Server -Temperature $Temperature -Thinking:$Thinking -FastPrefill:$FastPrefill
         Invoke-NInferLauncher -Plan $plan -Distribution $Distribution -NoBrowser:$NoBrowser -StartupTimeoutSeconds $StartupTimeoutSeconds
     } catch {
         Write-Error $_ -ErrorAction Continue
