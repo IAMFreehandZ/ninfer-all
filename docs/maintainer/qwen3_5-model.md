@@ -232,7 +232,9 @@ can share it:
 - the mixer input once for the four attention or GDN input projections, never for the GDN A/B
   control projections, which read the same normalized input unrotated;
 - the gated attention and GDN outputs before their output projections;
-- the FFN input before gate/up, and SwiGLU's output through `silu_mul_hadamard` before down;
+- the FFN input before gate/up, and SwiGLU's output before down: `swiglu_hadamard_linear_add`
+  runs the FFN after the input rotation, fusing SwiGLU, the transform and the down input's
+  quantization into the T2 prefill tile where both projections take it;
 - the final hidden before every target, MTP, DFlash and proposal head call, on a copy where the
   primal hidden is read again (the DFlash2 candidate selector).
 
@@ -290,7 +292,10 @@ implementation own chunk-boundary and continuation alignment.
 
 An optional proposal head supplies an indexed vocabulary subset for draft prediction. Its row map
 converts proposal rows to actual token IDs. Full target verification continues to use the full
-output head. Backend selection, draft width and proposal-head choice are fixed at startup.
+output head. Backend selection, draft width and proposal-head choice are fixed at startup. A
+ternary proposal or draft head projects under its Linear policy like the output head, so the
+`prefill_a8` load option gives it s8 activations on an integer-capable build; that changes only
+the candidates offered to verification.
 
 ## Vision and multimodal positions
 
